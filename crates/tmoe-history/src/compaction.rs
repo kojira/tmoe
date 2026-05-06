@@ -41,6 +41,10 @@ impl AgentLens for LabeledLens {
             AgentView::Observer => "[witness]",
         };
         let kept = self.filter_for_view(raw_body);
+        if kept.trim().is_empty() {
+            // このターンは自分の関心事ではない → 何も追記しない (パーソナリティ別フィルタ)。
+            return existing.to_string();
+        }
         if existing.is_empty() {
             format!("{} {}: {}", head, self.label, kept)
         } else {
@@ -89,12 +93,9 @@ impl LabeledLens {
                     .any(|n| lower.contains(&n.to_lowercase()))
             })
             .collect();
-        if lines.is_empty() {
-            // フォールバック: 先頭 80 文字を要約として残す (空 view を避ける)。
-            body.chars().take(80).collect()
-        } else {
-            lines.join(" / ")
-        }
+        // 関心事が無いなら空を返す (= このターンは自分の view に残さない)。
+        // 空フォールバックを使わないことで「3 view が異なる粒度を持つ」が成立する。
+        lines.join(" / ")
     }
 }
 
@@ -145,6 +146,13 @@ pub fn compact_turn_for_all(
         };
         match latest {
             Some(node) => {
+                // 関心事ゼロ (extend_leaf が変化なしを返した) のターンは無視する。
+                // ref_raw_ids も伸ばさず、Supervisor / Observer の view が「関心事のない
+                // ターン」で汚染されないようにする (= 三角形を維持する)。
+                if next_summary == node.summary {
+                    updated.push(node);
+                    continue;
+                }
                 let mut ref_raw = node.ref_raw_ids.clone();
                 let mut ref_h = node.ref_hashes.clone();
                 if !ref_raw.contains(&raw_node.id) {
@@ -160,6 +168,11 @@ pub fn compact_turn_for_all(
                 updated.push(refreshed);
             }
             None => {
+                if next_summary.is_empty() {
+                    // このエージェントの最初のターンが関心事ゼロ → ノードを作らない。
+                    // 後続ターンで関心事が来たら、そのとき初めて level=0 ノードを生成する。
+                    continue;
+                }
                 let new_node = store.append_summary(AppendSummary {
                     feature_id: feature_id.to_string(),
                     agent,

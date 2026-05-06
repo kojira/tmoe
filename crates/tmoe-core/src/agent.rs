@@ -120,7 +120,7 @@ fn try_parse_tool_call(text: &str) -> Option<ToolCall> {
 
 /// `"<key>":"<value>"` 形式から、value を抽出する。値内に \" を含む場合は \" として取り扱う。
 /// 生の `"` は終端と判断するため、複数行に渡る巨大文字列の抽出には使えない (= path / tool 用)。
-fn extract_simple_string_field(text: &str, key: &str) -> Option<String> {
+pub(crate) fn extract_simple_string_field(text: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let mut search_from = 0;
     while let Some(rel) = text[search_from..].find(&needle) {
@@ -200,6 +200,56 @@ fn extract_content_field_lossy(text: &str) -> Option<String> {
     Some(unescape_json_string(core))
 }
 
+/// `"<key>"\s*:\s*<bool>` から bool を取り出す。
+pub(crate) fn extract_bool_field(text: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(&needle) {
+        let key_end = from + rel + needle.len();
+        let after = text[key_end..].trim_start_matches(|c: char| c.is_whitespace());
+        let after = after.strip_prefix(':')?.trim_start_matches(|c: char| c.is_whitespace());
+        if let Some(rest) = after.strip_prefix("true") {
+            // ensure word boundary
+            if rest.chars().next().map_or(true, |c| !c.is_alphanumeric() && c != '_') {
+                return Some(true);
+            }
+        }
+        if let Some(rest) = after.strip_prefix("false") {
+            if rest.chars().next().map_or(true, |c| !c.is_alphanumeric() && c != '_') {
+                return Some(false);
+            }
+        }
+        from = key_end;
+    }
+    None
+}
+
+/// `"<key>"\s*:\s*<number>` から数値を取り出す。
+pub(crate) fn extract_number_field(text: &str, key: &str) -> Option<f64> {
+    let needle = format!("\"{key}\"");
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(&needle) {
+        let key_end = from + rel + needle.len();
+        let after = text[key_end..].trim_start_matches(|c: char| c.is_whitespace());
+        let after = after.strip_prefix(':')?.trim_start_matches(|c: char| c.is_whitespace());
+        let mut end = 0usize;
+        for (i, c) in after.char_indices() {
+            if c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E' {
+                end = i + c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if end > 0 {
+            if let Ok(n) = after[..end].parse::<f64>() {
+                return Some(n);
+            }
+        }
+        from = key_end;
+    }
+    None
+}
+
 fn unescape_json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_bs = false;
@@ -249,7 +299,7 @@ fn recover_tool_call(text: &str) -> Option<ToolCall> {
 /// 実 LLM の出力に頻出する「文字列値内に生の改行・タブ・制御文字が混じった JSON」を
 /// 仕様準拠の JSON に直す lenient 変換。
 /// 二重引用符の内側でのみエスケープ処理を行い、外側 (構造) はそのまま保つ。
-fn lenient_jsonify(text: &str) -> String {
+pub(crate) fn lenient_jsonify(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
     let mut in_string = false;
     let mut prev_backslash = false;

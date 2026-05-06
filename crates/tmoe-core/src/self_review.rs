@@ -36,21 +36,7 @@ pub async fn supervisor_review_diff(
 }
 
 fn parse_vote(text: &str) -> Option<Vote> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end < start {
-        return None;
-    }
-    let payload = &text[start..=end];
-    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let approve = v.get("approve")?.as_bool()?;
-    let confidence = v.get("confidence")?.as_f64()? as f32;
-    let note = v
-        .get("note")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    Some(Vote { approve, confidence, note })
+    crate::trio::parse_vote(text)
 }
 
 #[cfg(test)]

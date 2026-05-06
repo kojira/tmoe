@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tmoe_core::{
     self_review::{supervisor_review_diff, SelfReviewOutcome},
-    ConsensusOutcome, ThrustChannel, Trio, UserThrust,
+    Agent, AgentRole, ConsensusOutcome, ThrustChannel, Trio, UserThrust,
 };
 use tmoe_history::{
     compact_turn_for_all, AgentLens, AgentView, AppendRaw, FeatureStatus, HistoryStore,
@@ -67,15 +67,16 @@ DONE"#,
     obs.push(ScriptedTurn::new(approve_json(0.85, "intent matches")));
     worker.push(ScriptedTurn::new(approve_json(0.85, "implementation complete")));
 
-    let trio = Trio::new(worker, sup, obs);
+    let trio = Trio::new(
+        Agent::new(AgentRole::Worker, worker, "worker-system"),
+        Agent::new(AgentRole::Supervisor, sup, "supervisor-system"),
+        Agent::new(AgentRole::Observer, obs, "observer-system"),
+    );
     let (tx, mut rx) = ThrustChannel::new();
     tx.send(UserThrust::Go { strength: 1.0 }).unwrap();
 
     let outcome = trio
         .run_step(
-            "worker-system",
-            "supervisor-system",
-            "observer-system",
             &[ChatMessage::user("src/util.rs に gcd を追加して")],
             &reg,
             &mut rx,
@@ -141,19 +142,16 @@ async fn parks_then_resumes_after_user_thrust() {
     obs.push(ScriptedTurn::new(approve_json(0.9, "")));
     worker.push(ScriptedTurn::new(approve_json(0.9, "")));
 
-    let trio = Trio::new(worker, sup, obs);
+    let trio = Trio::new(
+        Agent::new(AgentRole::Worker, worker, "worker-system"),
+        Agent::new(AgentRole::Supervisor, sup, "supervisor-system"),
+        Agent::new(AgentRole::Observer, obs, "observer-system"),
+    );
     let (tx, mut rx) = ThrustChannel::new();
 
     // Concierge は何も送っていない → park。
     let parked = trio
-        .run_step(
-            "w",
-            "s",
-            "o",
-            &[ChatMessage::user("noop")],
-            &reg,
-            &mut rx,
-        )
+        .run_step(&[ChatMessage::user("noop")], &reg, &mut rx)
         .await
         .unwrap();
     assert!(matches!(parked.last, ConsensusOutcome::Parked { .. }));
@@ -161,14 +159,7 @@ async fn parks_then_resumes_after_user_thrust() {
     // ユーザー Z 軸 Go → 次の run_step で commit。
     tx.send(UserThrust::Go { strength: 1.0 }).unwrap();
     let committed = trio
-        .run_step(
-            "w",
-            "s",
-            "o",
-            &[ChatMessage::user("noop")],
-            &reg,
-            &mut rx,
-        )
+        .run_step(&[ChatMessage::user("noop")], &reg, &mut rx)
         .await
         .unwrap();
     assert!(matches!(committed.last, ConsensusOutcome::Commit { .. }));
@@ -194,19 +185,16 @@ async fn supervisor_initial_reject_then_eventual_approve() {
     obs.push(ScriptedTurn::new(approve_json(0.8, "")));
     worker.push(ScriptedTurn::new(approve_json(0.8, "")));
 
-    let trio = Trio::new(worker, sup, obs);
+    let trio = Trio::new(
+        Agent::new(AgentRole::Worker, worker, "worker-system"),
+        Agent::new(AgentRole::Supervisor, sup, "supervisor-system"),
+        Agent::new(AgentRole::Observer, obs, "observer-system"),
+    );
     let (tx, mut rx) = ThrustChannel::new();
     tx.send(UserThrust::Go { strength: 1.0 }).unwrap();
 
     let outcome = trio
-        .run_step(
-            "w",
-            "s",
-            "o",
-            &[ChatMessage::user("retry-task")],
-            &reg,
-            &mut rx,
-        )
+        .run_step(&[ChatMessage::user("retry-task")], &reg, &mut rx)
         .await
         .unwrap();
     assert!(outcome.steps >= 2, "expected at least 2 iterations, got {}", outcome.steps);
@@ -268,23 +256,20 @@ async fn observer_can_warn_and_reject_for_loop_detection() {
         obs.push(ScriptedTurn::new(reject_json(0.95, "loop suspected")));
         worker.push(ScriptedTurn::new(approve_json(0.7, "")));
     }
-    let trio = Trio::new(worker, sup, obs)
-        .with_thresholds(tmoe_core::ConsensusThresholds {
-            max_iter_per_step: 4,
-            ..Default::default()
-        });
+    let trio = Trio::new(
+        Agent::new(AgentRole::Worker, worker, "worker-system"),
+        Agent::new(AgentRole::Supervisor, sup, "supervisor-system"),
+        Agent::new(AgentRole::Observer, obs, "observer-system"),
+    )
+    .with_thresholds(tmoe_core::ConsensusThresholds {
+        max_iter_per_step: 4,
+        ..Default::default()
+    });
 
     let (tx, mut rx) = ThrustChannel::new();
     tx.send(UserThrust::Go { strength: 1.0 }).unwrap();
     let outcome = trio
-        .run_step(
-            "w",
-            "s",
-            "o",
-            &[ChatMessage::user("loop-y")],
-            &reg,
-            &mut rx,
-        )
+        .run_step(&[ChatMessage::user("loop-y")], &reg, &mut rx)
         .await
         .unwrap();
     // Observer の veto により 平面合意できず escalate。
