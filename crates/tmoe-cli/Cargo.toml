@@ -10,8 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
 tmoe-core.workspace = true
 tmoe-llm.workspace = true
 tmoe-history.workspace = true
@@ -19,3 +23,7 @@ tmoe-tree.workspace = true
 tmoe-rag.workspace = true
 tmoe-tools.workspace = true
 tmoe-prompts.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

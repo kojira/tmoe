@@ -8,5 +8,16 @@
 //! 「3」という個数は数学的安定性に基づいて固定: ①同一直線上にない 3 点が平面を一意に決定
 //! ②三角形は最小の剛体多角形 ③3+1 で 3 次元空間が完成する。社会・宗教アナロジーは用いない。
 
+pub mod agent;
+pub mod proposal;
+pub mod self_review;
+pub mod thrust;
 pub mod trio;
 pub mod vote;
+
+pub use agent::{single_agent_loop, AgentRole, ParsedToolCall, ProposalMessage};
+pub use proposal::Proposal;
+pub use self_review::{supervisor_review_diff, SelfReviewOutcome};
+pub use thrust::{ThrustChannel, ThrustReceiver, ThrustSender, UserThrust};
+pub use trio::{ConsensusOutcome, ConsensusThresholds, Trio, TrioOutcome};
+pub use vote::{triangle_balance, Vote};

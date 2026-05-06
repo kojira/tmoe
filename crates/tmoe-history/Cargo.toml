@@ -9,3 +9,11 @@ anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+ulid.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -8,9 +8,18 @@ license.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-tokio.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 tracing.workspace = true
+async-trait.workspace = true
+futures.workspace = true
 tmoe-llm.workspace = true
 tmoe-history.workspace = true
 tmoe-prompts.workspace = true
 tmoe-tools.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+git2.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tmoe-history.workspace = true

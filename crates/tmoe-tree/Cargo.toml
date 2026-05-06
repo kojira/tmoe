@@ -6,4 +6,15 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+ulid.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
