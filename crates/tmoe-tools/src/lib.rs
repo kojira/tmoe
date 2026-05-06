@@ -7,6 +7,7 @@
 //!   - Observer: read + metrics (write も run_cmd も持たない)
 //! - 危険コマンド (rm -rf / git reset --hard 等) は Supervisor の拒否権でブロック
 
+pub mod explore;
 pub mod git;
 pub mod permission;
 pub mod registry;
@@ -14,6 +15,7 @@ pub mod tool;
 pub mod tools;
 pub mod web;
 
+pub use explore::{GrepTextTool, ListFilesTool};
 pub use git::{
     carve_worktree, cleanup_worktree, commit as git_commit, stage_all, working_diff_text,
     GitError, GitResult, WorktreeHandle,
@@ -21,5 +23,5 @@ pub use git::{
 pub use permission::{Permission, PermissionProfile};
 pub use registry::ToolRegistry;
 pub use tool::{Tool, ToolCall, ToolError, ToolOutput, ToolResult};
-pub use tools::{default_blocklist, EditFileTool, ReadFileTool, RunCmdTool};
+pub use tools::{default_blocklist, EditFileTool, PatchFileTool, ReadFileTool, RunCmdTool};
 pub use web::{WebFetchTool, WebSearchTool};

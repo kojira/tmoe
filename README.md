@@ -122,7 +122,11 @@ Worker は次のツールを既定で持つ (`tmoe-tools`):
 
 | ツール | 用途 | Permission |
 |--------|------|-----------|
-| `read_file` / `edit_file` | ファイル読み書き | Read / Write |
+| `read_file` | ファイル読み取り | Read |
+| `edit_file` | ファイル全文書き込み (新規作成・全置換) | Write |
+| `patch_file` | **位置指定の部分編集** (Aider 風 search/replace、唯一マッチを既定で要求) | Write |
+| `list_files` | glob で**ファイル列挙** (`**/*.rs` 等、target/.git/node_modules を skip) | Read |
+| `grep_text` | リテラル/正規表現で**行検索** (case_insensitive、サブパス限定可) | Read |
 | `run_cmd` | プロセス実行 (危険コマンドはブロックリスト経由で拒否) | Run |
 | `web_search` / `web_fetch` | **Web 検索・取得** (Obscura ヘッドレスブラウザ) | Read |
 

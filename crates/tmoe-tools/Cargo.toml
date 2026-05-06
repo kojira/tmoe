@@ -11,6 +11,9 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 git2.workspace = true
+walkdir.workspace = true
+globset.workspace = true
+regex.workspace = true
 tokio = { workspace = true, features = ["process", "rt", "macros", "io-util", "fs"] }
 
 [dev-dependencies]

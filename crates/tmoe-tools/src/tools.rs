@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 use tokio::process::Command;
 
-fn join_within(root: &Path, rel: &str) -> Result<PathBuf, ToolError> {
+pub(crate) fn join_within(root: &Path, rel: &str) -> Result<PathBuf, ToolError> {
     let candidate = Path::new(rel);
     if candidate.is_absolute() {
         return Err(ToolError::Args(format!("path must be relative: {rel}")));
@@ -18,6 +18,19 @@ fn join_within(root: &Path, rel: &str) -> Result<PathBuf, ToolError> {
         }
     }
     Ok(root.join(candidate))
+}
+
+pub(crate) fn default_skip_dirs() -> Vec<String> {
+    vec![
+        "target".into(),
+        "node_modules".into(),
+        ".git".into(),
+        "dist".into(),
+        "build".into(),
+        "__pycache__".into(),
+        ".venv".into(),
+        "venv".into(),
+    ]
 }
 
 // --- read_file ---------------------------------------------------------
@@ -69,6 +82,76 @@ impl Tool for EditFileTool {
         }
         tokio::fs::write(&path, a.content.as_bytes()).await?;
         Ok(ToolOutput::text(format!("wrote {} bytes to {}", a.content.len(), a.path)))
+    }
+}
+
+// --- patch_file (Aider 風 search/replace) ----------------------------
+
+/// 既存ファイルに対する **位置指定の部分編集**。
+/// `edit_file` のような全文上書きではなく、正確な search 文字列を replace に置換する。
+/// LLM のトークン消費を抑え、長いファイルへの介入を最小化するための主力ツール。
+pub struct PatchFileTool {
+    pub root: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct PatchArgs {
+    path: String,
+    /// 置換対象の文字列。空は不可。改行を含めて構わない。
+    search: String,
+    /// 置換後の文字列。
+    replace: String,
+    /// true なら全マッチを置換。false (既定) は **唯一のマッチ** を要求し、
+    /// 0 件 / 2 件以上ならエラー (= 意図せざる別箇所への置換を防ぐ)。
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[async_trait]
+impl Tool for PatchFileTool {
+    fn name(&self) -> &str { "patch_file" }
+    fn requires(&self) -> Permission { Permission::Write }
+
+    async fn call(&self, args: &serde_json::Value) -> ToolResult {
+        let a: PatchArgs = serde_json::from_value(args.clone())?;
+        if a.search.is_empty() {
+            return Err(ToolError::Args("patch_file: search must not be empty".into()));
+        }
+        let path = join_within(&self.root, &a.path)?;
+        if !path.exists() {
+            return Err(ToolError::Args(format!(
+                "patch_file: file does not exist: {} (use edit_file to create)",
+                a.path
+            )));
+        }
+        let original = tokio::fs::read_to_string(&path).await?;
+        let occurrences = original.matches(&a.search).count();
+        if occurrences == 0 {
+            return Err(ToolError::Args(format!(
+                "patch_file: search not found in {} ({} byte search string)",
+                a.path,
+                a.search.len()
+            )));
+        }
+        if !a.replace_all && occurrences > 1 {
+            return Err(ToolError::Args(format!(
+                "patch_file: search matched {occurrences} times in {} but replace_all=false; \
+                 expand the search to be unique or pass replace_all=true",
+                a.path
+            )));
+        }
+        let updated = if a.replace_all {
+            original.replace(&a.search, &a.replace)
+        } else {
+            original.replacen(&a.search, &a.replace, 1)
+        };
+        tokio::fs::write(&path, updated.as_bytes()).await?;
+        Ok(ToolOutput::text(format!(
+            "patched {} ({} replacement{})",
+            a.path,
+            occurrences,
+            if occurrences == 1 { "" } else { "s" }
+        )))
     }
 }
 
@@ -241,6 +324,188 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stdout.trim(), "tmoe");
+    }
+
+    #[tokio::test]
+    async fn patch_file_unique_search_replaces_in_place() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "fn old_name() { 1 + 1 }\n").unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(PatchFileTool { root: root.clone() }));
+        let out = reg
+            .invoke(
+                &ToolCall {
+                    name: "patch_file".into(),
+                    args: serde_json::json!({
+                        "path": "a.rs",
+                        "search": "fn old_name()",
+                        "replace": "fn new_name()",
+                    }),
+                },
+                &PermissionProfile::worker(),
+            )
+            .await
+            .unwrap();
+        assert!(out.stdout.contains("1 replacement"));
+        let body = std::fs::read_to_string(root.join("a.rs")).unwrap();
+        assert!(body.contains("fn new_name()"));
+        assert!(!body.contains("fn old_name()"));
+    }
+
+    #[tokio::test]
+    async fn patch_file_rejects_ambiguous_match() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "todo\ntodo\nthird line\n").unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(PatchFileTool { root: root.clone() }));
+        let err = reg
+            .invoke(
+                &ToolCall {
+                    name: "patch_file".into(),
+                    args: serde_json::json!({
+                        "path": "a.rs",
+                        "search": "todo",
+                        "replace": "done",
+                    }),
+                },
+                &PermissionProfile::worker(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Args(msg) => assert!(msg.contains("matched 2 times")),
+            other => panic!("expected Args error, got {other:?}"),
+        }
+        // 元のファイルは変更されていないこと
+        let body = std::fs::read_to_string(root.join("a.rs")).unwrap();
+        assert_eq!(body, "todo\ntodo\nthird line\n");
+    }
+
+    #[tokio::test]
+    async fn patch_file_replace_all_overrides_uniqueness() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "old\nold\nkeep\n").unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(PatchFileTool { root: root.clone() }));
+        let out = reg
+            .invoke(
+                &ToolCall {
+                    name: "patch_file".into(),
+                    args: serde_json::json!({
+                        "path": "a.rs",
+                        "search": "old",
+                        "replace": "new",
+                        "replace_all": true,
+                    }),
+                },
+                &PermissionProfile::worker(),
+            )
+            .await
+            .unwrap();
+        assert!(out.stdout.contains("2 replacements"));
+        let body = std::fs::read_to_string(root.join("a.rs")).unwrap();
+        assert_eq!(body, "new\nnew\nkeep\n");
+    }
+
+    #[tokio::test]
+    async fn patch_file_search_not_found_is_args_error() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "abc\n").unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(PatchFileTool { root: root.clone() }));
+        let err = reg
+            .invoke(
+                &ToolCall {
+                    name: "patch_file".into(),
+                    args: serde_json::json!({
+                        "path": "a.rs",
+                        "search": "xyz",
+                        "replace": "qwerty",
+                    }),
+                },
+                &PermissionProfile::worker(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Args(_)));
+    }
+
+    #[tokio::test]
+    async fn patch_file_empty_search_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "abc\n").unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(PatchFileTool { root: root.clone() }));
+        let err = reg
+            .invoke(
+                &ToolCall {
+                    name: "patch_file".into(),
+                    args: serde_json::json!({
+                        "path": "a.rs",
+                        "search": "",
+                        "replace": "x",
+                    }),
+                },
+                &PermissionProfile::worker(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Args(_)));
+    }
+
+    #[tokio::test]
+    async fn patch_file_missing_file_is_args_error() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(PatchFileTool { root: root.clone() }));
+        let err = reg
+            .invoke(
+                &ToolCall {
+                    name: "patch_file".into(),
+                    args: serde_json::json!({
+                        "path": "nope.rs",
+                        "search": "x",
+                        "replace": "y",
+                    }),
+                },
+                &PermissionProfile::worker(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Args(msg) => assert!(msg.contains("does not exist")),
+            other => panic!("expected Args error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_file_supervisor_cannot_call() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "x\n").unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(PatchFileTool { root: root.clone() }));
+        let err = reg
+            .invoke(
+                &ToolCall {
+                    name: "patch_file".into(),
+                    args: serde_json::json!({
+                        "path": "a.rs",
+                        "search": "x",
+                        "replace": "y",
+                    }),
+                },
+                &PermissionProfile::supervisor(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Permission { .. }));
     }
 
     #[tokio::test]
