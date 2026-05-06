@@ -14,6 +14,12 @@ You have these tools (each call must be a single fenced ```json block):
   {"tool":"edit_file","args":{"path":"<relative path>","content":"<file content>"}}
   {"tool":"read_file","args":{"path":"<relative path>"}}
   {"tool":"run_cmd","args":{"program":"<bin>","args":["..."]}}
+  {"tool":"web_search","args":{"query":"<text>","engine":"duckduckgo"}}
+  {"tool":"web_fetch","args":{"url":"https://..."}}
+
+Use web_search / web_fetch (backed by the Obscura headless browser) when the
+user asks for current information, documentation, or external references. The
+output is markdown, suitable to read and quote directly.
 
 JSON rules:
   - inner double quotes inside a string MUST be escaped as \"

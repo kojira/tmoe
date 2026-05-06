@@ -12,6 +12,7 @@ pub mod permission;
 pub mod registry;
 pub mod tool;
 pub mod tools;
+pub mod web;
 
 pub use git::{
     carve_worktree, cleanup_worktree, commit as git_commit, stage_all, working_diff_text,
@@ -21,3 +22,4 @@ pub use permission::{Permission, PermissionProfile};
 pub use registry::ToolRegistry;
 pub use tool::{Tool, ToolCall, ToolError, ToolOutput, ToolResult};
 pub use tools::{default_blocklist, EditFileTool, ReadFileTool, RunCmdTool};
+pub use web::{WebFetchTool, WebSearchTool};

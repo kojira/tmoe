@@ -116,6 +116,38 @@ tmoe-llm は OpenAI 互換 HTTP の抽象レイヤで、`draft_model` 設定値�
 
 ---
 
+## ビルトインスキル
+
+Worker は次のツールを既定で持つ (`tmoe-tools`):
+
+| ツール | 用途 | Permission |
+|--------|------|-----------|
+| `read_file` / `edit_file` | ファイル読み書き | Read / Write |
+| `run_cmd` | プロセス実行 (危険コマンドはブロックリスト経由で拒否) | Run |
+| `web_search` / `web_fetch` | **Web 検索・取得** (Obscura ヘッドレスブラウザ) | Read |
+
+`web_search` / `web_fetch` は [h4ckf0r0day/obscura](https://github.com/h4ckf0r0day/obscura)
+をバックエンドに使う。LLM フレンドリーな markdown 出力 (`obscura fetch <URL> --dump markdown`)
+を直接 Worker に渡す。
+
+```bash
+# Obscura のインストール (Linux x86_64 バイナリ)
+curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
+tar xzf obscura-x86_64-linux.tar.gz
+# あるいは cargo build --release (Apple Silicon を含むクロスビルド向け)
+
+# tmoe からの参照: PATH に置くか、明示的にバイナリパスを指定する
+export TMOE_OBSCURA_BIN=/path/to/obscura
+```
+
+`TMOE_OBSCURA_BIN` 未設定なら `obscura` (= PATH) にフォールバック。
+Worker からの呼び出し例:
+
+```json
+{"tool":"web_search","args":{"query":"speculative decoding rust","engine":"duckduckgo"}}
+{"tool":"web_fetch","args":{"url":"https://docs.vllm.ai/en/latest/features/spec_decode.html"}}
+```
+
 ## インストール
 
 ```bash
