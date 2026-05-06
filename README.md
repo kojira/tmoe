@@ -188,6 +188,22 @@ tmoe/
     └── DESIGN.md        # 詳細設計
 ```
 
+## テスト
+
+```bash
+# 通常テスト (Mock LLM のみ、決定論的・高速)
+cargo test --workspace
+
+# 実 LLM に対する gated e2e (Worker が実際に Rust の FizzBuzz を書く)
+TMOE_E2E_LLM_URL=http://127.0.0.1:8080/v1 \
+TMOE_E2E_LLM_MODEL=qwen2.5-coder-32b-instruct \
+TMOE_E2E_LLM_BACKEND=llama_cpp \
+  cargo test --workspace -- --ignored
+```
+
+`TMOE_E2E_LLM_*` を設定しないと実 LLM テストは skip される。
+バックエンドは `llama_cpp | vllm | lm_studio | rapid_mlx | openai_compat` を選択可能。
+
 ## ロードマップ
 
 | Phase | 内容 |

@@ -16,3 +16,6 @@ Cargo.lock.bak
 
 # config — example のみ追跡し、実体は無視
 /config/tmoe.toml
+
+# Claude Code harness scratch
+/.claude/

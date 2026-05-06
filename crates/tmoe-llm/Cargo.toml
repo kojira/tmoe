@@ -19,3 +19,5 @@ bytes.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+url.workspace = true
+futures.workspace = true

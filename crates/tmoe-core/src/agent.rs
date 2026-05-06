@@ -95,14 +95,196 @@ pub fn parse_proposal(text: &str) -> Proposal {
 }
 
 fn try_parse_tool_call(text: &str) -> Option<ToolCall> {
-    // 必要最小限: "tool" と "args" を含む JSON object であること。
+    // 必要最小限: "tool" と "args" を含むこと。
     if !(text.contains("\"tool\"") && text.contains("\"args\"")) {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    let name = v.get("tool")?.as_str()?.to_string();
-    let args = v.get("args")?.clone();
-    Some(ToolCall { name, args })
+    // 1) 厳格 JSON
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        if let (Some(name), Some(args)) = (v.get("tool").and_then(|x| x.as_str()), v.get("args"))
+        {
+            return Some(ToolCall { name: name.to_string(), args: args.clone() });
+        }
+    }
+    // 2) 文字列値内の生改行・タブのみエスケープした緩い JSON
+    let lenient = lenient_jsonify(text);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&lenient) {
+        if let (Some(name), Some(args)) = (v.get("tool").and_then(|x| x.as_str()), v.get("args"))
+        {
+            return Some(ToolCall { name: name.to_string(), args: args.clone() });
+        }
+    }
+    // 3) 構造ベース recovery: tool/path は単純文字列、content は object の閉じから逆推定。
+    recover_tool_call(text)
+}
+
+/// `"<key>":"<value>"` 形式から、value を抽出する。値内に \" を含む場合は \" として取り扱う。
+/// 生の `"` は終端と判断するため、複数行に渡る巨大文字列の抽出には使えない (= path / tool 用)。
+fn extract_simple_string_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(&needle) {
+        let key_end = search_from + rel + needle.len();
+        let after_key = &text[key_end..];
+        let colon = after_key.find(':')?;
+        let after_colon = after_key[colon + 1..].trim_start();
+        if !after_colon.starts_with('"') {
+            search_from = key_end;
+            continue;
+        }
+        let body = &after_colon[1..];
+        // \" をエスケープとして扱いつつ終端 " を探す。
+        let mut out = String::new();
+        let mut prev_bs = false;
+        for c in body.chars() {
+            if prev_bs {
+                match c {
+                    '"' | '\\' | '/' => out.push(c),
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+                prev_bs = false;
+                continue;
+            }
+            if c == '\\' {
+                prev_bs = true;
+                continue;
+            }
+            if c == '"' {
+                return Some(out);
+            }
+            out.push(c);
+        }
+        return None;
+    }
+    None
+}
+
+/// `"content": "<...>"` を、外側の args/object の閉じ波括弧から逆算して切り出す。
+/// 値内部に生 `"` を含む LLM 出力 (Rust の `"FizzBuzz"` 等) を救うための仕組み。
+fn extract_content_field_lossy(text: &str) -> Option<String> {
+    let key_pos = text.find("\"content\"")?;
+    let after_key = &text[key_pos + "\"content\"".len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let inner = &after_colon[1..];
+
+    // 末尾フェンス・空白・閉じ括弧を順に剥がし、最後に残る `"` を文字列終端とみなす。
+    let trimmed = inner.trim_end();
+    let trimmed = trimmed.trim_end_matches('`');
+    let trimmed = trimmed.trim_end();
+    let mut s = trimmed.to_string();
+    // 末尾の `}` を 2 つまで剥がす (= args object と外側 tool object の閉じ)。
+    for _ in 0..2 {
+        let t = s.trim_end();
+        if t.ends_with('}') {
+            s = t[..t.len() - 1].to_string();
+        } else {
+            break;
+        }
+    }
+    let s = s.trim_end();
+    if !s.ends_with('"') {
+        return None;
+    }
+    let core = &s[..s.len() - 1];
+    // 既に \n / \\ などでエスケープされている場合があるので、JSON エスケープを最低限解く。
+    Some(unescape_json_string(core))
+}
+
+fn unescape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_bs = false;
+    for c in s.chars() {
+        if prev_bs {
+            match c {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+            prev_bs = false;
+            continue;
+        }
+        if c == '\\' {
+            prev_bs = true;
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn recover_tool_call(text: &str) -> Option<ToolCall> {
+    let name = extract_simple_string_field(text, "tool")?;
+    let path = extract_simple_string_field(text, "path");
+    let content = extract_content_field_lossy(text);
+    if path.is_none() && content.is_none() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    if let Some(p) = path {
+        args.insert("path".into(), serde_json::Value::String(p));
+    }
+    if let Some(c) = content {
+        args.insert("content".into(), serde_json::Value::String(c));
+    }
+    Some(ToolCall { name, args: serde_json::Value::Object(args) })
+}
+
+/// 実 LLM の出力に頻出する「文字列値内に生の改行・タブ・制御文字が混じった JSON」を
+/// 仕様準拠の JSON に直す lenient 変換。
+/// 二重引用符の内側でのみエスケープ処理を行い、外側 (構造) はそのまま保つ。
+fn lenient_jsonify(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for c in text.chars() {
+        if in_string {
+            if prev_backslash {
+                out.push(c);
+                prev_backslash = false;
+                continue;
+            }
+            match c {
+                '"' => {
+                    out.push('"');
+                    in_string = false;
+                }
+                '\\' => {
+                    out.push('\\');
+                    prev_backslash = true;
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                ch if (ch as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", ch as u32));
+                }
+                ch => out.push(ch),
+            }
+        } else {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -173,6 +355,46 @@ mod tests {
         let p = parse_proposal("{\"tool\":\"read_file\",\"args\":{\"path\":\"x.rs\"}}\n");
         assert_eq!(p.tool_calls.len(), 1);
         assert_eq!(p.tool_calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn parse_recovers_unescaped_inner_quotes() {
+        // 実 LLM 出力の典型: content 値内に Rust の "FizzBuzz" のような生引用符が残る。
+        let raw = r#"```json
+{
+  "tool": "edit_file",
+  "args": {
+    "path": "src/fizzbuzz.rs",
+    "content": "pub fn fizzbuzz(n: u32) -> Vec<String> {\n    (1..=n).map(|i| match (i % 3, i % 5) {\n        (0, 0) => "FizzBuzz".to_string(),\n        (0, _) => "Fizz".to_string(),\n        (_, 0) => "Buzz".to_string(),\n        _ => i.to_string(),\n    }).collect()\n}"
+  }
+}
+```
+DONE"#;
+        let p = parse_proposal(raw);
+        assert_eq!(p.tool_calls.len(), 1, "raw text was:\n{raw}");
+        assert_eq!(p.tool_calls[0].name, "edit_file");
+        let args = &p.tool_calls[0].args;
+        assert_eq!(args.get("path").and_then(|v| v.as_str()), Some("src/fizzbuzz.rs"));
+        let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(content.contains("FizzBuzz"));
+        assert!(content.contains("pub fn fizzbuzz"));
+    }
+
+    #[test]
+    fn parse_lenient_string_with_raw_newlines() {
+        // 実 LLM が出しがちな「文字列値に生改行を含む JSON」を扱えること。
+        let raw = "```json\n{\n  \"tool\": \"edit_file\",\n  \"args\": {\n    \"path\": \"a.rs\",\n    \"content\": \"fn main() {\n    println!(\\\"hi\\\");\n}\"\n  }\n}\n```\nDONE";
+        let p = parse_proposal(raw);
+        assert_eq!(p.tool_calls.len(), 1, "raw text was:\n{raw}");
+        assert_eq!(p.tool_calls[0].name, "edit_file");
+        let content = p.tool_calls[0]
+            .args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(content.contains("println!"));
+        // 生改行が改行のまま復元される。
+        assert!(content.contains('\n'));
     }
 
     #[tokio::test]
