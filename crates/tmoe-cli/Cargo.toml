@@ -1,0 +1,21 @@
+[package]
+name = "tmoe-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tmoe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tmoe-core.workspace = true
+tmoe-llm.workspace = true
+tmoe-history.workspace = true
+tmoe-tree.workspace = true
+tmoe-rag.workspace = true
+tmoe-tools.workspace = true
+tmoe-prompts.workspace = true

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tmoe-cli",
+    "crates/tmoe-core",
+    "crates/tmoe-llm",
+    "crates/tmoe-tree",
+    "crates/tmoe-rag",
+    "crates/tmoe-history",
+    "crates/tmoe-tools",
+    "crates/tmoe-prompts",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+repository = "https://github.com/kojira/tmoe"
+
+[workspace.dependencies]
+tmoe-core = { path = "crates/tmoe-core" }
+tmoe-llm = { path = "crates/tmoe-llm" }
+tmoe-tree = { path = "crates/tmoe-tree" }
+tmoe-rag = { path = "crates/tmoe-rag" }
+tmoe-history = { path = "crates/tmoe-history" }
+tmoe-tools = { path = "crates/tmoe-tools" }
+tmoe-prompts = { path = "crates/tmoe-prompts" }
+
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

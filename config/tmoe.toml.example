@@ -1,0 +1,36 @@
+# tmoe configuration example
+# 実環境ではこのファイルを config/tmoe.toml にコピーして編集する
+
+[llm]
+# backend: llama_cpp | vllm | lm_studio | rapid_mlx | openai_compat
+backend = "llama_cpp"
+base_url = "http://127.0.0.1:8080/v1"
+api_key = ""
+
+# main_model: 主推論モデル
+main_model = "qwen2.5-coder-32b-instruct"
+
+# draft_model: 投機的推論用ドラフトモデル
+# バックエンドが投機推論未対応 (例: rapid_mlx 現行版) の場合は無視される
+draft_model = "qwen2.5-coder-0.5b-instruct"
+spec_n_max = 16
+
+[trio]
+# 合意プロトコルの前進閾値
+confidence_sum_min = 2.4    # 3 頂点の confidence 和の下限
+triangle_balance_min = 0.6  # min/max。1.0 が正三角形、0 で縮退
+max_iter_per_step = 8       # 1 ステップで諦めてエスカレーションするまでの試行回数
+
+[history]
+# 階層履歴の物理保存場所
+db_path = "~/.tmoe/db.sqlite"
+features_dir = "~/.tmoe/features"
+
+# 逐次コンパクションの巻き上げ閾値 (ノードあたり概算トークン)
+rollup_threshold_tokens = 2000
+
+[tui]
+# ホットキー
+hotkey_pause = "Ctrl-P"
+hotkey_kill = "Ctrl-K"
+hotkey_tree = "Ctrl-T"

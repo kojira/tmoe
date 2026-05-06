@@ -1,0 +1,18 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# tmoe runtime data
+/.tmoe/
+~/.tmoe/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# config — example のみ追跡し、実体は無視
+/config/tmoe.toml
