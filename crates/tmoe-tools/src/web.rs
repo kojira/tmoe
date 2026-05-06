@@ -1,8 +1,8 @@
 //! Web ビルトインスキル — Obscura ヘッドレスブラウザ (h4ckf0r0day/obscura) を背後に使う。
 //!
-//! Obscura は Rust 製の CDP 互換ヘッドレスブラウザで、`obscura fetch <URL> --dump markdown`
-//! のように呼び出すと LLM 向けの整形済みマークダウンを返す。tmoe の Worker は web_fetch /
-//! web_search を `Permission::Read` として呼べる。
+//! Obscura は Rust 製の CDP 互換ヘッドレスブラウザで、`obscura fetch <URL> --dump text`
+//! のように呼び出すと JS レンダリング済みのプレーンテキストを返す。tmoe の Worker は
+//! web_fetch / web_search を `Permission::Read` として呼べる。
 //!
 //! - `web_fetch(url)`        : 単一 URL をマークダウン化して返す
 //! - `web_search(query)`     : DuckDuckGo HTML 版を Obscura で取得し検索結果のマークダウンを返す
@@ -99,7 +99,7 @@ impl Tool for WebFetchTool {
     async fn call(&self, args: &serde_json::Value) -> ToolResult {
         let a: FetchArgs = serde_json::from_value(args.clone())?;
         validate_url(&a.url)?;
-        run_obscura(&self.resolved_bin(), &["fetch", &a.url, "--dump", "markdown"]).await
+        run_obscura(&self.resolved_bin(), &["fetch", &a.url, "--dump", "text"]).await
     }
 }
 
@@ -147,7 +147,7 @@ impl Tool for WebSearchTool {
             other => return Err(ToolError::Args(format!("unsupported engine: {other}"))),
         };
         validate_url(&url)?;
-        run_obscura(&self.resolved_bin(), &["fetch", &url, "--dump", "markdown"]).await
+        run_obscura(&self.resolved_bin(), &["fetch", &url, "--dump", "text"]).await
     }
 }
 
@@ -232,13 +232,13 @@ exit 7
             .unwrap();
         assert!(out.stdout.contains("fake markdown"));
         assert!(out.stdout.contains("URL: https://example.com"));
-        assert!(out.stdout.contains("DUMP: markdown"));
+        assert!(out.stdout.contains("DUMP: text"));
 
         let recorded = std::fs::read_to_string(&log_path).unwrap();
         assert!(recorded.contains("fetch"), "args were: {recorded}");
         assert!(recorded.contains("https://example.com"));
         assert!(recorded.contains("--dump"));
-        assert!(recorded.contains("markdown"));
+        assert!(recorded.contains("text"));
     }
 
     #[tokio::test]

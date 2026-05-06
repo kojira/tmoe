@@ -127,17 +127,26 @@ Worker は次のツールを既定で持つ (`tmoe-tools`):
 | `web_search` / `web_fetch` | **Web 検索・取得** (Obscura ヘッドレスブラウザ) | Read |
 
 `web_search` / `web_fetch` は [h4ckf0r0day/obscura](https://github.com/h4ckf0r0day/obscura)
-をバックエンドに使う。LLM フレンドリーな markdown 出力 (`obscura fetch <URL> --dump markdown`)
-を直接 Worker に渡す。
+をバックエンドに使う。`obscura fetch <URL> --dump text` で得られる
+レンダリング済みテキストを Worker に直接渡す。
 
 ```bash
-# Obscura のインストール (Linux x86_64 バイナリ)
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
-tar xzf obscura-x86_64-linux.tar.gz
-# あるいは cargo build --release (Apple Silicon を含むクロスビルド向け)
+# Obscura のインストール
+# Apple Silicon
+curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
+tar xzf obscura-aarch64-macos.tar.gz
+# Linux x86_64
+# curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
 
 # tmoe からの参照: PATH に置くか、明示的にバイナリパスを指定する
 export TMOE_OBSCURA_BIN=/path/to/obscura
+```
+
+実 Obscura に対する gated e2e:
+
+```bash
+TMOE_E2E_OBSCURA_BIN=/path/to/obscura \
+  cargo test -p tmoe-tools --test e2e_real_obscura -- --ignored
 ```
 
 `TMOE_OBSCURA_BIN` 未設定なら `obscura` (= PATH) にフォールバック。

@@ -19,7 +19,7 @@ You have these tools (each call must be a single fenced ```json block):
 
 Use web_search / web_fetch (backed by the Obscura headless browser) when the
 user asks for current information, documentation, or external references. The
-output is markdown, suitable to read and quote directly.
+output is plain rendered text from the page, suitable to read and quote directly.
 
 JSON rules:
   - inner double quotes inside a string MUST be escaped as \"
