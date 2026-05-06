@@ -159,13 +159,18 @@ llama-server \
 ./target/release/tmoe
 ```
 
-ホットキー:
+ホットキー (動作中の Trio に Z 軸推進シグナルを直接届ける):
 
-| キー | 動作 |
-|------|------|
-| `Ctrl-P` | Trio を一時停止 (z_thrust ← 0) |
-| `Ctrl-K` | 現在の feature を強制中断 |
-| `Ctrl-T` | 機能ツリー表示の切替 |
+| キー | 動作 | UserThrust |
+|------|------|-----------|
+| `Ctrl-P` | Trio を一時停止 (park) | `Pause` |
+| `Ctrl-G` | park 状態の Trio を再開 | `Go { strength: 1.0 }` |
+| `Ctrl-K` | 現在の feature を強制中断 | `Stop` |
+| `Ctrl-C` / `Esc` | tmoe そのものを終了 | — |
+
+park 中も Concierge ペインは入力を受け付け続けるため、エージェント停止と
+ユーザー操作の両立が保たれる (常駐非ブロッキング設計)。
+e2e: `crates/tmoe-cli/tests/e2e_hotkey_pause.rs` がこの不変条件を検証する。
 
 ---
 

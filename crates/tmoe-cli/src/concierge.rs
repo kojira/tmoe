@@ -1,8 +1,11 @@
-//! Concierge: ユーザーの自然言語入力を Z 軸推進シグナル `UserThrust` に翻訳する
-//! I/O チャネル。エージェントの一員ではない。
+//! Concierge: ユーザーの自然言語入力 + ホットキーを Z 軸推進シグナル `UserThrust` に
+//! 翻訳する I/O チャネル。エージェントの一員ではない。
 //!
-//! Phase 6 では決定的なルールベース実装。Phase 後半で LLM へ置換可能。
+//! 純粋関数で実装し、TUI 側は `translate` / `key_to_thrust` を呼ぶだけ。これにより
+//! e2e テストはキーイベントをシミュレートして「Ctrl-P で park / Ctrl-G で再開」を
+//! 決定的に検証できる。
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tmoe_core::UserThrust;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +44,25 @@ pub fn translate(input: &str) -> UserThrust {
         ConciergeIntent::Redirect => UserThrust::Redirect {
             instruction: input.trim().to_string(),
         },
+    }
+}
+
+/// 制御キーを `UserThrust` に直接翻訳する。テキスト入力経路 (`translate`) の代替で
+/// あり、ユーザーは入力中でも Ctrl-P / Ctrl-G / Ctrl-K で Trio に介入できる。
+///
+/// マッピング:
+///   Ctrl-P  -> Pause     (動作中の Trio を park)
+///   Ctrl-G  -> Go        (park された Trio を進める)
+///   Ctrl-K  -> Stop      (現在の feature を中断)
+pub fn key_to_thrust(key: KeyEvent) -> Option<UserThrust> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('p') | KeyCode::Char('P') => Some(UserThrust::Pause),
+        KeyCode::Char('g') | KeyCode::Char('G') => Some(UserThrust::Go { strength: 1.0 }),
+        KeyCode::Char('k') | KeyCode::Char('K') => Some(UserThrust::Stop),
+        _ => None,
     }
 }
 
@@ -92,5 +114,43 @@ mod tests {
         assert!(matches!(translate("pause"), UserThrust::Pause));
         assert!(matches!(translate("stop"), UserThrust::Stop));
         assert!(matches!(translate("change something"), UserThrust::Redirect { .. }));
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+    fn plain(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn ctrl_p_pauses() {
+        assert!(matches!(key_to_thrust(ctrl('p')), Some(UserThrust::Pause)));
+        assert!(matches!(key_to_thrust(ctrl('P')), Some(UserThrust::Pause)));
+    }
+
+    #[test]
+    fn ctrl_g_goes() {
+        assert!(matches!(
+            key_to_thrust(ctrl('g')),
+            Some(UserThrust::Go { .. })
+        ));
+    }
+
+    #[test]
+    fn ctrl_k_stops() {
+        assert!(matches!(key_to_thrust(ctrl('k')), Some(UserThrust::Stop)));
+    }
+
+    #[test]
+    fn plain_letter_does_not_thrust() {
+        assert!(key_to_thrust(plain('p')).is_none());
+        assert!(key_to_thrust(plain('g')).is_none());
+    }
+
+    #[test]
+    fn unrelated_ctrl_keys_ignored() {
+        assert!(key_to_thrust(ctrl('a')).is_none());
+        assert!(key_to_thrust(ctrl('z')).is_none());
     }
 }

@@ -8,7 +8,7 @@ mod concierge;
 
 use anyhow::Result;
 use app::App;
-use concierge::translate;
+use concierge::{key_to_thrust, translate};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -78,13 +78,18 @@ fn run_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<
                 }
                 match (k.code, k.modifiers) {
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => break,
-                    (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                        send_thrust(&tx, &mut app, UserThrust::Pause, "(pause)");
+                    _ if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(thrust) = key_to_thrust(k) {
+                            let label = match &thrust {
+                                UserThrust::Pause => "(Ctrl-P pause)",
+                                UserThrust::Go { .. } => "(Ctrl-G go)",
+                                UserThrust::Stop => "(Ctrl-K stop)",
+                                UserThrust::Redirect { .. } => "(redirect)",
+                            };
+                            send_thrust(&tx, &mut app, thrust, label);
+                        }
                     }
-                    (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                        send_thrust(&tx, &mut app, UserThrust::Stop, "(stop)");
-                    }
-                    (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                    (KeyCode::Char(c), _) => {
                         app.append_char(c);
                     }
                     (KeyCode::Backspace, _) => app.backspace(),
