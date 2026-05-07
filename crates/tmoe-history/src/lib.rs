@@ -10,6 +10,7 @@ pub mod compaction;
 pub mod error;
 pub mod store;
 pub mod types;
+pub mod view;
 
 pub use compaction::{compact_turn_for_all, rollup_one_level, AgentLens, LabeledLens, LlmLens};
 pub use error::{HistoryError, Result};
@@ -17,3 +18,4 @@ pub use store::{AppendRaw, AppendSummary, HistoryStore};
 pub use types::{
     AgentSummaryNode, AgentView, Feature, FeatureStatus, RawKind, RawNode,
 };
+pub use view::{render_prior_views_block, HistoryViewProvider, ViewProvider};

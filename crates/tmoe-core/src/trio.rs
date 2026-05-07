@@ -15,6 +15,7 @@ use crate::thrust::{ThrustReceiver, UserThrust};
 use crate::vote::{triangle_balance, Vote};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tmoe_history::{render_prior_views_block, ViewProvider};
 use tmoe_llm::{ChatMessage, LlmClient};
 use tmoe_tools::ToolRegistry;
 
@@ -108,6 +109,11 @@ impl Trio {
     /// `thrust_rx` から Z 軸推進シグナルを drain する。`Pause` または `Go strength<=0` は park。
     /// `Redirect` は破棄して再ループ、`Stop` は中断。
     ///
+    /// `views` が `Some` のとき、Supervisor / Observer / Worker 自己評価の vote プロンプトに
+    /// 各エージェントの最新 level=0 view brief (PRIOR VIEWS ブロック) を prepend する。
+    /// これにより Worker view が「書かれて誰も読まない」状態を回避し、Supervisor は縦断的な
+    /// 進捗主張のサニティを、Observer は 3 view を並べたループ検出を行える。
+    ///
     /// 平面合意できなかった場合、直前の Worker 出力 + Supervisor / Observer の差し戻し note を
     /// **次の試行の Worker への入力に追記**する (フィードバックループ)。これにより Worker は
     /// 同じ部分実装を繰り返さず、指摘を吸収して改訂できる。
@@ -116,6 +122,17 @@ impl Trio {
         user_messages: &[ChatMessage],
         tools: &ToolRegistry,
         thrust_rx: &mut ThrustReceiver,
+    ) -> anyhow::Result<TrioOutcome> {
+        self.run_step_with_views(user_messages, tools, thrust_rx, None).await
+    }
+
+    /// `run_step` の view 注入版。`views` が None なら `run_step` と等価。
+    pub async fn run_step_with_views(
+        &self,
+        user_messages: &[ChatMessage],
+        tools: &ToolRegistry,
+        thrust_rx: &mut ThrustReceiver,
+        views: Option<&dyn ViewProvider>,
     ) -> anyhow::Result<TrioOutcome> {
         let mut steps = 0u32;
         let mut last_proposal = Proposal::empty();
@@ -146,11 +163,18 @@ impl Trio {
             last_proposal = proposal.clone();
 
             // 2) Supervisor / Observer / Worker 自己評価で 3 票を集める。
+            //    views が指定されていれば各 vote プロンプトに PRIOR VIEWS ブロックを prepend し、
+            //    Supervisor は Worker view から縦断的な進捗主張を、Observer は 3 view 並走で
+            //    ループ兆候を検知できるようにする。
+            let prior_block = views
+                .map(render_prior_views_block)
+                .filter(|s| !s.is_empty());
             let s_vote = ask_vote(
                 self.supervisor.llm.as_ref(),
                 &self.supervisor.system,
                 &proposal,
                 user_messages,
+                prior_block.as_deref(),
             )
             .await?;
             let o_vote = ask_vote(
@@ -158,6 +182,7 @@ impl Trio {
                 &self.observer.system,
                 &proposal,
                 user_messages,
+                prior_block.as_deref(),
             )
             .await?;
             // Worker 自己評価は Worker LLM に「自分の提案を 0..1 で confidence する」よう問い直す。
@@ -166,6 +191,7 @@ impl Trio {
                 &self.worker.system,
                 &proposal,
                 user_messages,
+                prior_block.as_deref(),
             )
             .await?;
 
@@ -275,8 +301,15 @@ async fn ask_vote(
     system: &str,
     proposal: &Proposal,
     base_user: &[ChatMessage],
+    prior_views: Option<&str>,
 ) -> anyhow::Result<Vote> {
     let mut messages = vec![ChatMessage::system(system)];
+    if let Some(block) = prior_views {
+        // PRIOR VIEWS は user メッセージとして base_user の前に置く。
+        // system に混ぜないのは、各エージェントのパーソナリティ system は不変属性として
+        // 保ちたいため (= ベクトルが時間を超えて保たれる)。
+        messages.push(ChatMessage::user(block.to_string()));
+    }
     messages.extend(base_user.iter().cloned());
     messages.push(ChatMessage::assistant(&proposal.raw_text));
     messages.push(ChatMessage::user(
@@ -536,6 +569,114 @@ DONE"#,
             ConsensusOutcome::Escalated { .. } => {}
             other => panic!("expected Escalated, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn supervisor_and_observer_receive_prior_views_block() {
+        use tmoe_history::{AgentView, ViewProvider};
+
+        // 各 view を一意な合言葉で返すフェイク ViewProvider。
+        // Trio が PRIOR VIEWS ブロックを各 vote プロンプトに本当に prepend したかは、
+        // MockLlmClient の calls() に同合言葉が現れるかで検証する。
+        struct FakeViews;
+        impl ViewProvider for FakeViews {
+            fn brief(&self, a: AgentView) -> Option<String> {
+                Some(match a {
+                    AgentView::Worker => "WORKER-NARRATIVE-X9".into(),
+                    AgentView::Supervisor => "SUPERVISOR-NARRATIVE-Y8".into(),
+                    AgentView::Observer => "OBSERVER-NARRATIVE-Z7".into(),
+                })
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let reg = registry(root.clone());
+        let worker = Arc::new(MockLlmClient::new("worker"));
+        let sup = Arc::new(MockLlmClient::new("sup"));
+        let obs = Arc::new(MockLlmClient::new("obs"));
+        worker.push(ScriptedTurn::new("DONE\n"));
+        sup.push(ScriptedTurn::new(approve(0.9)));
+        obs.push(ScriptedTurn::new(approve(0.85)));
+        worker.push(ScriptedTurn::new(approve(0.85)));
+        let trio = Trio::new(
+            Agent::new(AgentRole::Worker, worker.clone(), "worker-system"),
+            Agent::new(AgentRole::Supervisor, sup.clone(), "supervisor-system"),
+            Agent::new(AgentRole::Observer, obs.clone(), "observer-system"),
+        );
+
+        let (tx, mut rx) = ThrustChannel::new();
+        tx.send(UserThrust::Go { strength: 1.0 }).unwrap();
+
+        let views: &dyn ViewProvider = &FakeViews;
+        let _ = trio
+            .run_step_with_views(
+                &[ChatMessage::user("noop")],
+                &reg,
+                &mut rx,
+                Some(views),
+            )
+            .await
+            .unwrap();
+
+        // Supervisor の vote 呼び出しに 3 view 全部の合言葉が現れているか。
+        // ここが空なら Worker view は依然「書かれて誰も読まない」状態を意味する。
+        let sup_calls = sup.calls();
+        assert_eq!(sup_calls.len(), 1, "supervisor should be asked exactly once for vote");
+        let sup_user_text: String = sup_calls[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sup_user_text.contains("WORKER-NARRATIVE-X9"),
+            "supervisor vote prompt missing Worker view: {sup_user_text}");
+        assert!(sup_user_text.contains("SUPERVISOR-NARRATIVE-Y8"));
+        assert!(sup_user_text.contains("OBSERVER-NARRATIVE-Z7"));
+
+        // Observer も同様。
+        let obs_calls = obs.calls();
+        let obs_user_text: String = obs_calls[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(obs_user_text.contains("WORKER-NARRATIVE-X9"));
+        assert!(obs_user_text.contains("SUPERVISOR-NARRATIVE-Y8"));
+        assert!(obs_user_text.contains("OBSERVER-NARRATIVE-Z7"));
+    }
+
+    #[tokio::test]
+    async fn no_prior_views_when_provider_absent() {
+        // run_step (= views=None) は PRIOR VIEWS ブロックを混入させてはいけない。
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let reg = registry(root.clone());
+        let worker = Arc::new(MockLlmClient::new("worker"));
+        let sup = Arc::new(MockLlmClient::new("sup"));
+        let obs = Arc::new(MockLlmClient::new("obs"));
+        worker.push(ScriptedTurn::new("DONE\n"));
+        sup.push(ScriptedTurn::new(approve(0.9)));
+        obs.push(ScriptedTurn::new(approve(0.85)));
+        worker.push(ScriptedTurn::new(approve(0.85)));
+        let trio = Trio::new(
+            Agent::new(AgentRole::Worker, worker.clone(), "worker-system"),
+            Agent::new(AgentRole::Supervisor, sup.clone(), "supervisor-system"),
+            Agent::new(AgentRole::Observer, obs.clone(), "observer-system"),
+        );
+
+        let (tx, mut rx) = ThrustChannel::new();
+        tx.send(UserThrust::Go { strength: 1.0 }).unwrap();
+        let _ = trio.run_step(&[ChatMessage::user("noop")], &reg, &mut rx).await.unwrap();
+
+        let sup_text: String = sup.calls()[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!sup_text.contains("PRIOR VIEWS"));
     }
 
     #[tokio::test]
