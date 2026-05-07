@@ -237,6 +237,13 @@ impl OpenAiCompatClient {
     }
 
     fn build_request_body(&self, req: &ChatRequest, stream: bool) -> serde_json::Value {
+        // Backend::Codex は OpenAI **Responses API** が前提なので、chat/completions の
+        // `messages` ではなく `input` (= 構造化された role + content blocks) を送る。
+        // opencode の plugin/codex.ts と同等のリクエスト形状にする。
+        if self.config.backend == Backend::Codex {
+            return build_codex_request_body(req, &self.config.main_model, stream);
+        }
+
         let mut body = serde_json::json!({
             "model": self.config.main_model,
             "messages": req.messages,
@@ -258,6 +265,47 @@ impl OpenAiCompatClient {
         }
         body
     }
+}
+
+/// OpenAI Responses API のリクエストボディを組み立てる。Backend::Codex 用。
+///
+/// 入力 chat/completions 形式 (`messages: [{role, content}]`) を Responses API の
+/// `input: [{role, content: [{type:"input_text", text}]}]` に変換する。
+/// system / developer / user / assistant の各ロールはそのまま渡し、content は単一テキスト
+/// 想定 (= tmoe は今のところ image / file / tool message を構造的に渡していない)。
+fn build_codex_request_body(req: &ChatRequest, model: &str, stream: bool) -> serde_json::Value {
+    let input: Vec<serde_json::Value> = req
+        .messages
+        .iter()
+        .map(|m| {
+            let role = match m.role {
+                crate::types::Role::System => "system",
+                crate::types::Role::User => "user",
+                crate::types::Role::Assistant => "assistant",
+                crate::types::Role::Tool => "tool",
+            };
+            // assistant のメッセージは output_text、それ以外は input_text を使う。
+            // Responses API は user/system/developer 側を input_*、assistant 履歴は output_* で受ける。
+            let content_type = if matches!(m.role, crate::types::Role::Assistant) {
+                "output_text"
+            } else {
+                "input_text"
+            };
+            serde_json::json!({
+                "role": role,
+                "content": [{"type": content_type, "text": m.content}],
+            })
+        })
+        .collect();
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "stream": stream,
+    });
+    if let Some(t) = req.temperature { body["temperature"] = t.into(); }
+    if let Some(m) = req.max_tokens { body["max_output_tokens"] = m.into(); }
+    body
 }
 
 fn backend_supports_speculative(backend: Backend) -> bool {
@@ -325,10 +373,40 @@ impl OpenAiCompatClient {
                 }
                 return Err(LlmError::BadStatus { status: status.as_u16(), body: body_text });
             }
+            // Backend::Codex のレスポンスは Responses API 形式 (`output[].content[]` から
+            // テキストを取り出す)。それ以外は OpenAI chat/completions 形式。
+            if self.config.backend == Backend::Codex {
+                let v: serde_json::Value = resp.json().await.map_err(LlmError::from)?;
+                return Ok(parse_codex_response(v));
+            }
             let parsed: OpenAiChatResponse = resp.json().await.map_err(LlmError::from)?;
             return Ok(parsed.into_chat_response());
         }
     }
+}
+
+/// Responses API の最小限レスポンスをパース。`output: [{type:"message", content:[{type:"output_text", text:"..."}]}]`
+/// から output_text の text を全部つなげて返す。reasoning や tool_use は無視 (= 文字列だけ取り出す)。
+fn parse_codex_response(v: serde_json::Value) -> ChatResponse {
+    let mut text = String::new();
+    if let Some(arr) = v.get("output").and_then(|o| o.as_array()) {
+        for item in arr {
+            if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                for c in content {
+                    if c.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                        if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
+                            text.push_str(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let finish_reason = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+    ChatResponse { content: text, finish_reason, usage: None }
 }
 
 fn is_transient_send_error(e: &reqwest::Error) -> bool {
@@ -560,6 +638,13 @@ fn take_next_event(buf: &[u8]) -> Option<(usize, Vec<u8>)> {
 }
 
 /// 1 イベントの本体 (複数行) から OpenAI 互換の data 行を抽出してデコードする。
+///
+/// 対応するレスポンス形式は 2 種類:
+///   1. **chat/completions stream** (`{"choices":[{"delta":{"content":"..."}}]}`)
+///   2. **OpenAI Responses API stream** (`{"type":"response.output_text.delta","delta":"..."}`)
+/// payload の中身を見て分岐する。Codex (= chatgpt.com/backend-api/codex/responses) は
+/// 後者を返す。Backend を引数で渡さなくても、event 自体に `type` フィールドがあれば
+/// Responses API と判定できる。
 fn decode_sse_event(body: &[u8]) -> Option<ChatDelta> {
     let text = match std::str::from_utf8(body) {
         Ok(s) => s,
@@ -579,6 +664,13 @@ fn decode_sse_event(body: &[u8]) -> Option<ChatDelta> {
     if payload == "[DONE]" {
         return Some(ChatDelta::Done { finish_reason: None });
     }
+    // まず Responses API 形式 (type フィールド) をチェック。
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if let Some(t) = v.get("type").and_then(|t| t.as_str()) {
+            return decode_codex_event(t, &v);
+        }
+    }
+    // chat/completions 形式。
     let chunk: OpenAiStreamChunk = match serde_json::from_str(&payload) {
         Ok(v) => v,
         Err(_) => return None,
@@ -595,6 +687,37 @@ fn decode_sse_event(body: &[u8]) -> Option<ChatDelta> {
         let _ = c.delta.role;
     }
     None
+}
+
+/// Responses API のストリーミングチャンクを ChatDelta にマップする。
+/// 関心があるのは:
+///   - `response.output_text.delta` → Token(delta)
+///   - `response.completed` / `response.incomplete` → Done
+///   - `error` → 内容を Done(reason) で包む (= 上位で見せる)
+/// それ以外 (`response.created` / reasoning / annotation など) は無視する。
+fn decode_codex_event(ty: &str, v: &serde_json::Value) -> Option<ChatDelta> {
+    match ty {
+        "response.output_text.delta" => v
+            .get("delta")
+            .and_then(|d| d.as_str())
+            .map(|s| ChatDelta::Token(s.to_string())),
+        "response.completed" | "response.incomplete" => {
+            let reason = v
+                .pointer("/response/incomplete_details/reason")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| Some(ty.to_string()));
+            Some(ChatDelta::Done { finish_reason: reason })
+        }
+        "error" => {
+            let msg = v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or(ty);
+            Some(ChatDelta::Done { finish_reason: Some(format!("error: {msg}")) })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -662,6 +785,75 @@ mod tests {
         let c = OpenAiCompatClient::new(cfg(Backend::Codex, None)).unwrap();
         let url = c.chat_url().unwrap();
         assert_eq!(url.as_str(), "https://chatgpt.com/backend-api/codex/responses");
+    }
+
+    /// Backend::Codex のリクエストボディは `messages` ではなく Responses API 形式の
+    /// `input` 配列を持つ。各メッセージは role + content[type="input_text"|"output_text"] で表現。
+    #[test]
+    fn build_request_body_for_codex_emits_responses_api_format() {
+        let c = OpenAiCompatClient::new(cfg(Backend::Codex, None)).unwrap();
+        let req = ChatRequest {
+            messages: vec![
+                ChatMessage::system("be brief"),
+                ChatMessage::user("hello"),
+            ],
+            max_tokens: Some(128),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let body = c.build_request_body(&req, true);
+        assert!(body.get("messages").is_none(), "should not have chat-completions `messages`");
+        assert_eq!(body["model"], "main");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_output_tokens"], 128);
+        let input = body["input"].as_array().expect("input must be array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "be brief");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["content"][0]["text"], "hello");
+    }
+
+    /// Responses API ストリームの `response.output_text.delta` が ChatDelta::Token に
+    /// マップされる。tmoe streaming sink が Codex 経由でも文字を受け取れることを確認。
+    #[test]
+    fn sse_decode_codex_text_delta_maps_to_token() {
+        let chunk = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"hi\"}\n\n";
+        let (_, ev) = take_next_event(chunk).expect("should parse event boundary");
+        let d = decode_sse_event(&ev).expect("should decode");
+        assert!(matches!(d, ChatDelta::Token(ref s) if s == "hi"), "got {d:?}");
+    }
+
+    /// `response.completed` チャンクは Done としてマップされて consumer 側のストリーム loop が抜ける。
+    #[test]
+    fn sse_decode_codex_completed_maps_to_done() {
+        let chunk = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n";
+        let (_, ev) = take_next_event(chunk).unwrap();
+        let d = decode_sse_event(&ev).unwrap();
+        assert!(matches!(d, ChatDelta::Done { .. }), "got {d:?}");
+    }
+
+    /// Responses API の non-stream レスポンスから output_text を全部つなげた ChatResponse が出る。
+    #[test]
+    fn parse_codex_response_concats_output_text() {
+        let v = serde_json::json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "foo "},
+                        {"type": "output_text", "text": "bar"},
+                    ],
+                }
+            ],
+        });
+        let r = parse_codex_response(v);
+        assert_eq!(r.content, "foo bar");
+        assert_eq!(r.finish_reason.as_deref(), Some("completed"));
     }
 
     /// Backend::Codex の場合、auth.json が無い + 未指定なら chat() は明示的なメッセージで
