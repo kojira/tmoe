@@ -41,10 +41,10 @@ Do not explain. Output only the JSON block followed by DONE.
 fn config_from_env() -> Option<OpenAiCompatConfig> {
     let base = env::var("TMOE_E2E_LLM_URL").ok()?;
     let main_model =
-        env::var("TMOE_E2E_LLM_MODEL").unwrap_or_else(|_| "qwen2.5-coder-32b-instruct".into());
+        env::var("TMOE_E2E_LLM_MODEL").unwrap_or_else(|_| "qwen3-coder-30b".into());
     let draft_model = env::var("TMOE_E2E_LLM_DRAFT").ok();
     let backend = match env::var("TMOE_E2E_LLM_BACKEND")
-        .unwrap_or_else(|_| "llama_cpp".into())
+        .unwrap_or_else(|_| "rapid_mlx".into())
         .as_str()
     {
         "vllm" => Backend::Vllm,
