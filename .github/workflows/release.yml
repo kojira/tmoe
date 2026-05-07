@@ -99,7 +99,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # rebase で main の先端を取り込むには tag commit と origin/main の共通祖先が要るので、
+      # 浅い clone (depth=1) にしないで full history を引く。tag 単独の commit しか
+      # ローカルに無いと `git rebase origin/main` が "non-fast-forward" 以外で詰まる。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Determine tag
         id: ver
@@ -225,5 +230,31 @@ jobs:
           fi
           git add Formula/tmoe.rb
           git commit -m "Formula: bump tmoe to ${VERSION} [skip ci]"
-          # tag push は detached HEAD なので、明示的に main に push する。
-          git push origin "HEAD:refs/heads/main"
+
+          # `tmoe` 本体側で別の commit が main に積まれた直後に走る release ジョブだと、
+          # ここの push が non-FF で reject される (= v0.1.2 で実際に発生した race)。
+          # 現状の checkout はタグ commit (= 多分過去の main HEAD) を見ているだけなので、
+          # 1) origin/main を fetch して
+          # 2) 自分の formula bump commit を rebase で先頭に置き直し
+          # 3) push を試みる
+          # を最大 5 回までリトライする。Formula/tmoe.rb 以外を触る他コミットとは
+          # 干渉しない (= 別ファイルの変更だけなら rebase は常に clean に通る)。
+          attempt=1
+          max_attempt=5
+          while [ "$attempt" -le "$max_attempt" ]; do
+            git fetch origin main
+            if ! git rebase origin/main; then
+              echo "::error::rebase against origin/main produced a conflict (attempt $attempt). Aborting."
+              git rebase --abort || true
+              exit 1
+            fi
+            if git push origin "HEAD:refs/heads/main"; then
+              echo "Formula bump pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "::warning::push rejected (attempt $attempt/$max_attempt) — refetching and retrying"
+            attempt=$((attempt + 1))
+            sleep $((attempt * 2))
+          done
+          echo "::error::Failed to push Formula bump after $max_attempt attempts."
+          exit 1
