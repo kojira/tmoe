@@ -18,6 +18,7 @@ You have these tools (each call must be a single fenced ```json block):
   {"tool":"grep_text","args":{"pattern":"TODO","regex":false,"case_insensitive":false}}
   {"tool":"search_source","args":{"query":"<concept or symbol you want to locate>"}}
   {"tool":"search_history","args":{"query":"<what you want to recall from past features>","agent":"any","scope":"all"}}
+  {"tool":"question","args":{"questions":[{"question":"<text>","options":["yes","no"],"multiple":false}]}}
   {"tool":"run_cmd","args":{"program":"<bin>","args":["..."]}}
   {"tool":"web_search","args":{"query":"<text>","engine":"duckduckgo"}}
   {"tool":"web_fetch","args":{"url":"https://..."}}

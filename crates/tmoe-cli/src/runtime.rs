@@ -43,6 +43,7 @@ use tmoe_tools::{
 
 use crate::agents_md;
 use crate::history_tool::SearchHistoryTool;
+use crate::question_tool::{HeadlessAsker, QuestionAsker, QuestionTool};
 use crate::source_tool::SearchSourceTool;
 use tokio::sync::mpsc;
 
@@ -57,7 +58,7 @@ pub enum RuntimeEvent {
     Done { ok: bool, message: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunOptions {
     pub task: String,
     pub workdir: PathBuf,
@@ -75,6 +76,25 @@ pub struct RunOptions {
     /// 既存 feature を再開する場合はその id を入れる。新規 feature を作りたいときは None。
     /// resume 時は HistoryStore からタイトルと 3 view brief を読んで Worker に prepend する。
     pub resume_feature_id: Option<String>,
+    /// Worker の `question` ツールが user に問い合わせるための asker。
+    /// None なら Headless asker (= 即エラー) を使う。
+    pub question_asker: Option<Arc<dyn QuestionAsker>>,
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("task", &self.task)
+            .field("workdir", &self.workdir)
+            .field("use_worktree", &self.use_worktree)
+            .field("open_pr", &self.open_pr)
+            .field("max_rounds", &self.max_rounds)
+            .field("cleanup_worktree", &self.cleanup_worktree)
+            .field("gh_bin", &self.gh_bin)
+            .field("resume_feature_id", &self.resume_feature_id)
+            .field("question_asker", &self.question_asker.as_ref().map(|_| "<asker>"))
+            .finish()
+    }
 }
 
 impl RunOptions {
@@ -88,6 +108,7 @@ impl RunOptions {
             cleanup_worktree: false,
             gh_bin: None,
             resume_feature_id: None,
+            question_asker: None,
         }
     }
 }
@@ -214,6 +235,12 @@ pub async fn run_feature(
     tools.register(std::sync::Arc::new(
         SearchHistoryTool::new(history_arc, llm.clone()).with_current_feature(feature.id.clone()),
     ));
+    // question ツールは asker を runtime オプションから受け取る。未指定なら Headless = 即エラー。
+    let asker: Arc<dyn QuestionAsker> = opts
+        .question_asker
+        .clone()
+        .unwrap_or_else(|| Arc::new(HeadlessAsker));
+    tools.register(std::sync::Arc::new(QuestionTool::new(asker)));
 
     // --- 5) Trio + ViewProvider
     let trio = Trio::from_shared_llm(llm.clone()).with_thresholds(ConsensusThresholds {
@@ -272,6 +299,9 @@ pub async fn run_feature(
          - search_source: PageIndex-style AST search (LLM walks the source tree)\n\
          - search_history: Agentic RAG over past tmoe features (3-view summaries) — \
             args {{\"query\":\"...\",\"agent\":\"worker|supervisor|observer|any\",\"scope\":\"all|current\"}}\n\
+         - question: ask the user a clarifying question — \
+            args {{\"questions\":[{{\"question\":\"...\",\"options\":[\"a\",\"b\"]}}]}} \
+            (errors in --headless mode)\n\
          - run_cmd: run a shell command (denylist enforced)\n\
          - web_search / web_fetch: optional, requires obscura on PATH\n\
          When you finish, emit a single line containing only DONE.",
