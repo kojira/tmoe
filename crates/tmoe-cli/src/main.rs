@@ -19,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::Widget;
 use ratatui::Terminal;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tmoe_core::{ThrustChannel, ThrustSender, UserThrust};
 use tokio::sync::mpsc;
@@ -158,14 +158,9 @@ enum HistorySub {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("TMOE_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init()
-        .ok();
+    // tracing は run_headless / run_tui の各エントリで初期化する。
+    // TUI 中に stderr へ流すと ratatui の描画の上に書き殴られて表示が壊れるので、
+    // モードごとに writer を切り替える必要がある (TUI 時はファイル、headless は stderr)。
 
     let argv: Vec<String> = std::env::args().collect();
     let args = parse_args(&argv)?;
@@ -184,6 +179,15 @@ async fn main() -> Result<()> {
         .workdir
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // 非 TUI な subcommand は stderr に tracing を出してよい (TUI と違って ratatui 描画なし)。
+    if args.subcommand_doctor
+        || args.subcommand_codex_login
+        || args.subcommand_history.is_some()
+        || args.subcommand_merge.is_some()
+    {
+        init_tracing_stderr();
+    }
 
     if args.subcommand_doctor {
         let ok = doctor(&cfg).await?;
@@ -228,6 +232,23 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Concierge ペイン内に表示する短いヘルプ。`tmoe --help` (CLI 側 `print_help`) は
+/// シェル起動時用なので別に長文。こっちは TUI で「何が打てるんだっけ」を即返す用。
+fn concierge_help_lines(log_path: &Path) -> Vec<String> {
+    vec![
+        "(tmoe) ── help ──".into(),
+        "(tmoe)   <free text>     start a new feature with that as the task".into(),
+        "(tmoe)   help / ?        show this help".into(),
+        "(tmoe)   quit / exit     leave the TUI (same as Esc / Ctrl-C)".into(),
+        "(tmoe) ── hotkeys ──".into(),
+        "(tmoe)   Ctrl-G          z_thrust=1.0 (resume the active feature)".into(),
+        "(tmoe)   Ctrl-P          z_thrust=0   (pause the active feature)".into(),
+        "(tmoe)   Ctrl-K          stop the active feature".into(),
+        "(tmoe)   Esc / Ctrl-C    quit the TUI (sends Stop first)".into(),
+        format!("(tmoe) logs -> {}", log_path.display()),
+    ]
+}
+
 fn print_help() {
     println!("tmoe — 3 + 1 (3 agents + user Z-axis) coding agent");
     println!();
@@ -260,12 +281,53 @@ fn print_help() {
     println!("    Ctrl-C / Esc        quit");
 }
 
+/// stderr に tracing を出す (= --headless / 非 TUI コマンド向け)。重複初期化は no-op。
+fn init_tracing_stderr() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("TMOE_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+}
+
+/// `<history_root>/tmoe.log` に tracing を流す (= TUI 起動中)。stderr に出すと ratatui の
+/// 描画の上に書き殴られて表示が壊れるのでファイルに逃がす。失敗したら sink にフォールバック。
+fn init_tracing_file(history_root: &Path) -> PathBuf {
+    let log_path = history_root.join("tmoe.log");
+    let _ = std::fs::create_dir_all(history_root);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            let _ = tracing_subscriber::fmt()
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_env("TMOE_LOG")
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .try_init();
+        }
+        Err(_) => {
+            let _ = tracing_subscriber::fmt()
+                .with_writer(io::sink)
+                .try_init();
+        }
+    }
+    log_path
+}
+
 async fn run_headless(
     task: String,
     cfg: config::Config,
     workdir: PathBuf,
     flags: RunFlags,
 ) -> Result<()> {
+    init_tracing_stderr();
     let (thrust_tx, thrust_rx) = ThrustChannel::new();
     thrust_tx
         .send(UserThrust::Go { strength: 1.0 })
@@ -316,12 +378,13 @@ fn run_tui(
     workdir: PathBuf,
     flags: RunFlags,
 ) -> Result<()> {
+    let log_path = init_tracing_file(&cfg.history_root);
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let res = tui_loop(&mut terminal, initial_task, cfg, workdir, flags);
+    let res = tui_loop(&mut terminal, initial_task, cfg, workdir, flags, log_path);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     res
@@ -333,6 +396,7 @@ fn tui_loop<B: ratatui::backend::Backend>(
     cfg: config::Config,
     workdir: PathBuf,
     flags: RunFlags,
+    log_path: PathBuf,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -341,8 +405,10 @@ fn tui_loop<B: ratatui::backend::Backend>(
     let (event_tx, mut event_rx) = mpsc::channel::<RuntimeEvent>(64);
 
     let mut app = App::new();
-    app.on_concierge("(tmoe) start typing. Enter to submit.".into());
-    app.on_concierge("(tmoe) Ctrl-G=Go  Ctrl-P=Pause  Ctrl-K=Stop  Esc=Quit".into());
+    app.on_concierge("(tmoe) Type a task and press Enter to start.".into());
+    app.on_concierge("(tmoe) Built-in commands: help / quit".into());
+    app.on_concierge("(tmoe) Hotkeys: Ctrl-G=Go  Ctrl-P=Pause  Ctrl-K=Stop  Esc=Quit".into());
+    app.on_concierge(format!("(tmoe) logs -> {}", log_path.display()));
 
     // 現在アクティブなセッションへの thrust 送信口。None ならアイドル (タスク未投入)。
     let mut current_thrust_tx: Option<ThrustSender> = None;
@@ -435,6 +501,26 @@ fn tui_loop<B: ratatui::backend::Backend>(
                         let line = app.take_input();
                         if line.is_empty() {
                             // 空 Enter: 何もしない。
+                        } else if matches!(
+                            line.trim().to_lowercase().as_str(),
+                            "help" | "?" | "/help" | ":help" | "h"
+                        ) {
+                            // ヘルプ語の入力は task ではなく Concierge 内で処理する。
+                            // 入っているのが既存セッション中でもアイドル中でも同じ挙動。
+                            app.on_concierge(format!("user> {line}"));
+                            for line in concierge_help_lines(&log_path) {
+                                app.on_concierge(line);
+                            }
+                        } else if matches!(
+                            line.trim().to_lowercase().as_str(),
+                            "quit" | "exit" | ":q" | ":quit" | "q"
+                        ) {
+                            // 明示的な終了コマンド。Esc / Ctrl-C と同等。アクティブ session があれば
+                            // Stop シグナルだけ送って TUI を畳む (タスクの後始末は runtime 側がやる)。
+                            if let Some(tx) = &current_thrust_tx {
+                                let _ = tx.send(UserThrust::Stop);
+                            }
+                            break;
                         } else if current_thrust_tx.is_none() {
                             // **アイドル時の Enter は新規セッションを spawn する**。
                             // Concierge::translate が "go/pause/stop" のような制御語を Redirect 以外に
