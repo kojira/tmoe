@@ -9,7 +9,7 @@
 //! 多数決ではない: 1 人でも反対していれば前進しない。
 //! 平面が均整していても Z が無ければ park し、Concierge は常時受付可能のまま入力を待つ。
 
-use crate::agent::{single_agent_loop, AgentRole};
+use crate::agent::{single_agent_loop_streaming, AgentRole, DeltaSink};
 use crate::proposal::Proposal;
 use crate::thrust::{ThrustReceiver, UserThrust};
 use crate::vote::{triangle_balance, Vote};
@@ -134,6 +134,30 @@ impl Trio {
         thrust_rx: &mut ThrustReceiver,
         views: Option<&dyn ViewProvider>,
     ) -> anyhow::Result<TrioOutcome> {
+        self.run_step_full(user_messages, tools, thrust_rx, views, None).await
+    }
+
+    /// streaming 対応版: Worker の応答 token を `on_worker_delta` に逐次流す。
+    /// Supervisor/Observer の vote は短いので streaming しない (= chat の 1 発呼出し)。
+    pub async fn run_step_streaming(
+        &self,
+        user_messages: &[ChatMessage],
+        tools: &ToolRegistry,
+        thrust_rx: &mut ThrustReceiver,
+        views: Option<&dyn ViewProvider>,
+        on_worker_delta: DeltaSink,
+    ) -> anyhow::Result<TrioOutcome> {
+        self.run_step_full(user_messages, tools, thrust_rx, views, Some(on_worker_delta)).await
+    }
+
+    async fn run_step_full(
+        &self,
+        user_messages: &[ChatMessage],
+        tools: &ToolRegistry,
+        thrust_rx: &mut ThrustReceiver,
+        views: Option<&dyn ViewProvider>,
+        on_worker_delta: Option<DeltaSink>,
+    ) -> anyhow::Result<TrioOutcome> {
         let mut steps = 0u32;
         let mut last_proposal = Proposal::empty();
         // 直前ターンのフィードバック (assistant 提案 + user 差し戻し)。空なら初回。
@@ -151,12 +175,13 @@ impl Trio {
             //    user_messages の後ろに直前ターンのフィードバックを連結する。
             let mut worker_input = user_messages.to_vec();
             worker_input.extend(feedback.clone());
-            let pm = single_agent_loop(
+            let pm = single_agent_loop_streaming(
                 AgentRole::Worker,
                 &self.worker.system,
                 worker_input,
                 self.worker.llm.as_ref(),
                 tools,
+                on_worker_delta.clone(),
             )
             .await?;
             let proposal = pm.proposal;

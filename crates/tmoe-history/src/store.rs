@@ -193,6 +193,32 @@ impl HistoryStore {
         Ok(())
     }
 
+    /// 全 feature 行を created_at の降順 (新しい順) で返す。doctor / `tmoe history` で使う。
+    pub fn list_features(&self) -> Result<Vec<Feature>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, status, root_node_id, created_at FROM feature \
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, title, status_s, root_node_id, created_at) = r?;
+            let status = FeatureStatus::parse(&status_s)
+                .ok_or_else(|| HistoryError::Invalid(format!("status {status_s}")))?;
+            out.push(Feature { id, title, status, root_node_id, created_at });
+        }
+        Ok(out)
+    }
+
     pub fn get_feature(&self, feature_id: &str) -> Result<Feature> {
         let conn = self.conn.lock().unwrap();
         let row = conn

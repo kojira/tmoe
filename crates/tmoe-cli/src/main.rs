@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use tmoe_cli::app::App;
 use tmoe_cli::concierge::{key_to_thrust, translate};
 use tmoe_cli::config;
-use tmoe_cli::runtime::{doctor, run_feature, RunOptions, RuntimeEvent};
+use tmoe_cli::runtime::{
+    doctor, history_list, history_show, merge_feature, run_feature, RunOptions, RuntimeEvent,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -35,6 +37,9 @@ struct Args {
     max_rounds: Option<u32>,
     task: Option<String>,
     subcommand_doctor: bool,
+    subcommand_history: Option<HistorySub>,
+    subcommand_merge: Option<String>,
+    resume_feature_id: Option<String>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args> {
@@ -85,10 +90,57 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         a.subcommand_doctor = true;
         positional.remove(0);
     }
+    // `tmoe merge <feature_id>`
+    if positional.first().map(|s| s.as_str()) == Some("merge") {
+        positional.remove(0);
+        let id = positional
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("`tmoe merge` needs <feature_id>"))?;
+        positional.remove(0);
+        a.subcommand_merge = Some(id);
+    }
+    // `tmoe resume <feature_id> [follow-up text...]`
+    if positional.first().map(|s| s.as_str()) == Some("resume") {
+        positional.remove(0);
+        let id = positional
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("`tmoe resume` needs <feature_id>"))?;
+        positional.remove(0);
+        a.resume_feature_id = Some(id);
+    }
+    // `tmoe history list` / `tmoe history show <id>`
+    if positional.first().map(|s| s.as_str()) == Some("history") {
+        positional.remove(0);
+        a.subcommand_history = Some(match positional.first().map(|s| s.as_str()) {
+            Some("list") => {
+                positional.remove(0);
+                HistorySub::List
+            }
+            Some("show") => {
+                positional.remove(0);
+                let id = positional
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("`tmoe history show` needs <feature_id>"))?;
+                positional.remove(0);
+                HistorySub::Show(id)
+            }
+            Some(other) => anyhow::bail!("unknown history subcommand: {other}"),
+            None => HistorySub::List,
+        });
+    }
     if !positional.is_empty() {
         a.task = Some(positional.join(" "));
     }
     Ok(a)
+}
+
+#[derive(Debug, Clone)]
+enum HistorySub {
+    List,
+    Show(String),
 }
 
 #[tokio::main]
@@ -124,14 +176,32 @@ async fn main() -> Result<()> {
         let ok = doctor(&cfg).await?;
         std::process::exit(if ok { 0 } else { 1 });
     }
+    if let Some(sub) = args.subcommand_history.clone() {
+        match sub {
+            HistorySub::List => history_list(&cfg)?,
+            HistorySub::Show(id) => history_show(&cfg, &id)?,
+        }
+        return Ok(());
+    }
+    if let Some(id) = args.subcommand_merge.clone() {
+        merge_feature(&cfg, &workdir, &id)?;
+        return Ok(());
+    }
 
     let flags = RunFlags {
         use_worktree: !args.no_worktree,
         cleanup_worktree: args.cleanup_worktree,
         open_pr: args.open_pr,
         max_rounds: args.max_rounds.unwrap_or(4),
+        resume_feature_id: args.resume_feature_id.clone(),
     };
-    match args.task.clone() {
+    // resume の場合、task が空でも OK (前回の続き)。デフォルト follow-up を入れる。
+    let effective_task = match (args.task.clone(), &args.resume_feature_id) {
+        (Some(t), _) => Some(t),
+        (None, Some(_)) => Some("Continue from where you left off.".to_string()),
+        (None, None) => None,
+    };
+    match effective_task {
         Some(task) if args.headless => run_headless(task, cfg, workdir, flags).await,
         Some(task) => run_tui(Some(task), cfg, workdir, flags),
         None if args.headless => {
@@ -148,6 +218,10 @@ fn print_help() {
     println!("    tmoe [options] \"<task description>\"");
     println!("    tmoe ask \"<task>\"  — same as above (DESIGN-doc form)");
     println!("    tmoe doctor         — diagnose config + LLM reachability + optional bins");
+    println!("    tmoe history list   — list past features stored in ~/.tmoe");
+    println!("    tmoe history show <feature_id>");
+    println!("    tmoe resume <feature_id> [follow-up text...]");
+    println!("    tmoe merge <feature_id>  — git merge --no-ff tmoe/feature/<id>");
     println!("    tmoe                — start the TUI without a task");
     println!("    tmoe --version      — print version");
     println!();
@@ -188,6 +262,7 @@ async fn run_headless(
         opts.cleanup_worktree = flags.cleanup_worktree;
         opts.open_pr = flags.open_pr;
         opts.max_rounds = flags.max_rounds;
+        opts.resume_feature_id = flags.resume_feature_id.clone();
         run_feature(cfg, opts, thrust_rx, Some(event_tx)).await
     });
 
@@ -208,12 +283,13 @@ async fn run_headless(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RunFlags {
     use_worktree: bool,
     cleanup_worktree: bool,
     open_pr: bool,
     max_rounds: u32,
+    resume_feature_id: Option<String>,
 }
 
 fn run_tui(
@@ -264,7 +340,7 @@ fn tui_loop<B: ratatui::backend::Backend>(
             &runtime,
             cfg.clone(),
             workdir.clone(),
-            flags,
+            flags.clone(),
             task,
             rx,
             event_tx.clone(),
@@ -352,7 +428,7 @@ fn tui_loop<B: ratatui::backend::Backend>(
                                 &runtime,
                                 cfg.clone(),
                                 workdir.clone(),
-                                flags,
+                                flags.clone(),
                                 line,
                                 rx,
                                 event_tx.clone(),
@@ -407,6 +483,7 @@ fn spawn_session(
         opts.cleanup_worktree = flags.cleanup_worktree;
         opts.open_pr = flags.open_pr;
         opts.max_rounds = flags.max_rounds;
+        opts.resume_feature_id = flags.resume_feature_id.clone();
         run_feature(cfg, opts, thrust_rx, Some(event_tx)).await
     }));
     app.on_concierge("(tmoe) feature spawned.".into());

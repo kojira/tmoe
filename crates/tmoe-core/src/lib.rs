@@ -16,8 +16,9 @@ pub mod trio;
 pub mod vote;
 
 pub use agent::{
-    run_worker_until_verified, single_agent_loop, AgentRole, ParsedToolCall, ProgressVerifier,
-    ProposalMessage, VerifierOutcome, WorkerRunResult,
+    run_worker_until_verified, single_agent_loop, single_agent_loop_streaming, AgentRole,
+    DeltaSink, ParsedToolCall, ProgressVerifier, ProposalMessage, VerifierOutcome,
+    WorkerRunResult,
 };
 pub(crate) use agent::{extract_bool_field, extract_number_field, extract_simple_string_field, lenient_jsonify};
 pub use proposal::Proposal;

@@ -410,6 +410,10 @@ where
     Ok(WorkerRunResult { turns: max_turns, completed: false, last })
 }
 
+/// LLM 出力 delta を逐次受け取るためのシンク。`single_agent_loop_streaming` で
+/// 設定された場合、Worker の応答 token 1 個ごとに呼ばれる。TUI ペインへの live 更新等に使う。
+pub type DeltaSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+
 /// 単体エージェントを 1 ステップだけ回す: LLM へ問い、Proposal を抽出し、Worker 役割なら
 /// ツールを実行する。Phase 4 ではこの 1 ステップが Trio の `worker.act` に相当する。
 pub async fn single_agent_loop(
@@ -419,11 +423,54 @@ pub async fn single_agent_loop(
     llm: &dyn LlmClient,
     tools: &ToolRegistry,
 ) -> anyhow::Result<ProposalMessage> {
+    single_agent_loop_streaming(role, system, user_messages, llm, tools, None).await
+}
+
+/// `single_agent_loop` の streaming 版。`on_delta` が `Some` のとき LLM レスポンスを
+/// `chat_stream` で受信し、token ごとに `on_delta(piece)` を呼ぶ。最終的に蓄積した content を
+/// `parse_proposal` する。`None` のときは従来通り `chat()` を 1 発で叩く (= 後方互換)。
+///
+/// stream の途中で I/O エラーが起きた場合は **そこまでに溜まった content** で proposal を
+/// パースして返す (= 部分結果も活かす)。完全失敗時のみ Err を返す。
+pub async fn single_agent_loop_streaming(
+    role: AgentRole,
+    system: &str,
+    user_messages: Vec<ChatMessage>,
+    llm: &dyn LlmClient,
+    tools: &ToolRegistry,
+    on_delta: Option<DeltaSink>,
+) -> anyhow::Result<ProposalMessage> {
+    use futures::StreamExt;
     let mut messages = Vec::with_capacity(user_messages.len() + 1);
     messages.push(ChatMessage::system(system));
     messages.extend(user_messages);
-    let resp = llm.chat(ChatRequest { messages, ..Default::default() }).await?;
-    let proposal = parse_proposal(&resp.content);
+
+    let content: String = if let Some(sink) = on_delta {
+        let mut stream = llm
+            .chat_stream(ChatRequest { messages, ..Default::default() })
+            .await?;
+        let mut acc = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(tmoe_llm::ChatDelta::Token(piece)) => {
+                    sink(piece.clone());
+                    acc.push_str(&piece);
+                }
+                Ok(tmoe_llm::ChatDelta::Done { .. }) => break,
+                Err(e) => {
+                    // 部分応答で proposal が成立する可能性がある (DONE 行や閉じフェンスがすでに来ている等)。
+                    // 完全切断扱いせず、ログだけ出して acc で先に進む。
+                    tracing::warn!("stream error after {} chars: {e}", acc.len());
+                    break;
+                }
+            }
+        }
+        acc
+    } else {
+        llm.chat(ChatRequest { messages, ..Default::default() }).await?.content
+    };
+
+    let proposal = parse_proposal(&content);
     let profile = role.permission_profile();
     let mut tool_outputs = Vec::with_capacity(proposal.tool_calls.len());
     if matches!(role, AgentRole::Worker) {

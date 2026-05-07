@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tmoe_core::{
-    ConsensusOutcome, ConsensusThresholds, ThrustReceiver, Trio, UserThrust,
+    ConsensusOutcome, ConsensusThresholds, DeltaSink, ThrustReceiver, Trio, UserThrust,
 };
 use tmoe_history::{
     compact_turn_for_all, AgentLens, AgentView, AppendRaw, HistoryStore, HistoryViewProvider,
@@ -71,6 +71,9 @@ pub struct RunOptions {
     pub cleanup_worktree: bool,
     /// gh バイナリの上書き。テストでスタブを差し込むときに使う。None の場合は PATH の `gh`。
     pub gh_bin: Option<PathBuf>,
+    /// 既存 feature を再開する場合はその id を入れる。新規 feature を作りたいときは None。
+    /// resume 時は HistoryStore からタイトルと 3 view brief を読んで Worker に prepend する。
+    pub resume_feature_id: Option<String>,
 }
 
 impl RunOptions {
@@ -83,6 +86,7 @@ impl RunOptions {
             max_rounds: 4,
             cleanup_worktree: false,
             gh_bin: None,
+            resume_feature_id: None,
         }
     }
 }
@@ -154,15 +158,22 @@ pub async fn run_feature(
         }
     }
 
-    // --- 1) History
+    // --- 1) History (新規 or resume)
     std::fs::create_dir_all(&cfg.history_root)
         .with_context(|| format!("create history root: {}", cfg.history_root.display()))?;
     let store = HistoryStore::open(&cfg.history_root)
         .with_context(|| format!("open history store: {}", cfg.history_root.display()))?;
-    let feature = store
-        .create_feature(&opts.task)
-        .context("create feature row")?;
-    status(format!("feature_id={} task={}", feature.id, opts.task));
+    let feature = if let Some(fid) = &opts.resume_feature_id {
+        let f = store
+            .get_feature(fid)
+            .with_context(|| format!("resume feature {fid}: not found"))?;
+        status(format!("resuming feature_id={} title={}", f.id, f.title));
+        f
+    } else {
+        let f = store.create_feature(&opts.task).context("create feature row")?;
+        status(format!("feature_id={} task={}", f.id, opts.task));
+        f
+    };
 
     // --- 2) Worktree
     let mut worktree_handle: Option<WorktreeHandle> = None;
@@ -219,8 +230,31 @@ pub async fn run_feature(
     }
     let agents_block = agents_ctx.render_for_prompt();
 
+    // Resume の場合は前回の 3 view brief を Worker に手渡す (= 「前回ここまでやった」)。
+    let resume_block = if opts.resume_feature_id.is_some() {
+        let mut s = String::from("RESUMING FEATURE — prior progress (3 personality views):\n\n");
+        for view in [AgentView::Worker, AgentView::Supervisor, AgentView::Observer] {
+            let label = view.as_str();
+            let brief = match store.latest_level0(&feature.id, view) {
+                Ok(Some(n)) => n.summary,
+                _ => "(no view yet)".into(),
+            };
+            s.push_str(&format!("--- {label} ---\n{brief}\n\n"));
+        }
+        s.push_str("Continue from this state. Do NOT redo work that the views indicate is already complete.\n\n");
+        s
+    } else {
+        String::new()
+    };
+
+    let task_line = if opts.resume_feature_id.is_some() {
+        format!("Original feature title: {}\nFollow-up instruction: {}", feature.title, opts.task)
+    } else {
+        opts.task.clone()
+    };
+
     let initial_prompt = format!(
-        "{agents}{task}\n\n\
+        "{agents}{resume}{task}\n\n\
          Available tools (call as a fenced ```json block with {{\"tool\":\"name\",\"args\":{{...}}}}):\n\
          - edit_file / read_file: full-file write or read\n\
          - patch_file: search/replace inside an existing file\n\
@@ -231,10 +265,31 @@ pub async fn run_feature(
          - web_search / web_fetch: optional, requires obscura on PATH\n\
          When you finish, emit a single line containing only DONE.",
         agents = agents_block,
-        task = opts.task,
+        resume = resume_block,
+        task = task_line,
     );
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(initial_prompt)];
     say("Trio starting (Worker / Supervisor / Observer)...".into());
+
+    // Worker の応答 token を **改行ごと** にまとめて RuntimeEvent::TrioLog に流す sink。
+    // event_tx が無ければ作らない (= headless で stderr 出力だけのとき streaming 不要)。
+    let worker_delta_sink: Option<DeltaSink> = event_tx.as_ref().map(|tx| {
+        let tx = tx.clone();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let buf2 = buf.clone();
+        let cb = move |piece: String| {
+            let mut b = buf2.lock().unwrap();
+            b.push_str(&piece);
+            while let Some(idx) = b.find('\n') {
+                let line: String = b.drain(..=idx).collect();
+                let line = line.trim_end_matches('\n');
+                if !line.trim().is_empty() {
+                    let _ = tx.try_send(RuntimeEvent::TrioLog(format!("worker: {line}")));
+                }
+            }
+        };
+        std::sync::Arc::new(cb) as DeltaSink
+    });
 
     // --- セッションループ ---
     let mut rounds_used: u32 = 0;
@@ -246,10 +301,15 @@ pub async fn run_feature(
         }
         rounds_used += 1;
         let provider = HistoryViewProvider::new(&store, feature.id.clone());
-        let outcome = trio
-            .run_step_with_views(&messages, &tools, &mut thrust_rx, Some(&provider))
-            .await
-            .context("Trio.run_step_with_views failed")?;
+        let outcome = if let Some(sink) = worker_delta_sink.clone() {
+            trio.run_step_streaming(&messages, &tools, &mut thrust_rx, Some(&provider), sink)
+                .await
+                .context("Trio.run_step_streaming failed")?
+        } else {
+            trio.run_step_with_views(&messages, &tools, &mut thrust_rx, Some(&provider))
+                .await
+                .context("Trio.run_step_with_views failed")?
+        };
 
         match outcome.last {
             ConsensusOutcome::Commit { proposal, votes } => {
@@ -583,6 +643,150 @@ fn which_gh() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// `tmoe merge <feature_id>`: feature の worktree ブランチ (`tmoe/feature/<id>`) を
+/// 現在のチェックアウト (= ユーザの cwd の git リポジトリ) に `git merge --no-ff` でマージする。
+///
+/// HistoryStore の get_feature でタイトルを引いてコミットメッセージに使う。merge 自体は
+/// `std::process::Command::new("git")` で実行する。conflict が出た場合は git の出力を素通しして
+/// ユーザが手動解決できるようにする (= ここで rollback しない)。
+pub fn merge_feature(cfg: &Config, workdir: &Path, feature_id: &str) -> Result<()> {
+    let store = HistoryStore::open(&cfg.history_root)
+        .with_context(|| format!("open history at {}", cfg.history_root.display()))?;
+    let feature = store
+        .get_feature(feature_id)
+        .with_context(|| format!("feature {feature_id} not found in history"))?;
+    let branch = format!("tmoe/feature/{}", feature_id);
+    if !is_git_repo(workdir) {
+        anyhow::bail!(
+            "current workdir ({}) is not inside a git repo; cd into the project root first",
+            workdir.display()
+        );
+    }
+    // ブランチ存在確認: `git rev-parse --verify <branch>` の終了コードで判定。
+    let exists = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg(&branch)
+        .current_dir(workdir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !exists {
+        anyhow::bail!(
+            "branch {branch} does not exist in this repo. \
+             Was this feature run with --no-worktree, or has the branch been pruned?"
+        );
+    }
+    let msg = format!("merge tmoe feature {} ({})", feature_id, feature.title);
+    println!("merging {branch} into HEAD with --no-ff");
+    let status = std::process::Command::new("git")
+        .arg("merge")
+        .arg("--no-ff")
+        .arg("-m")
+        .arg(&msg)
+        .arg(&branch)
+        .current_dir(workdir)
+        .status()
+        .context("spawn git merge")?;
+    if !status.success() {
+        anyhow::bail!(
+            "git merge exited with {}. Resolve conflicts and run `git merge --continue`, \
+             or `git merge --abort` to back out.",
+            status
+        );
+    }
+    println!("merge complete");
+    Ok(())
+}
+
+/// `tmoe history list`: HistoryStore の全 feature を新しい順に印字する。
+pub fn history_list(cfg: &Config) -> Result<()> {
+    let store = HistoryStore::open(&cfg.history_root)
+        .with_context(|| format!("open history at {}", cfg.history_root.display()))?;
+    let features = store.list_features().context("list features")?;
+    if features.is_empty() {
+        println!("(no features yet at {})", cfg.history_root.display());
+        return Ok(());
+    }
+    println!("history root: {}", cfg.history_root.display());
+    println!(
+        "{:<28} {:<14} {:<20} {}",
+        "feature_id", "status", "created_at", "title"
+    );
+    for f in features {
+        let dt = chrono_like(f.created_at);
+        let title_short = short(&f.title, 60);
+        println!(
+            "{:<28} {:<14} {:<20} {}",
+            f.id,
+            format!("{:?}", f.status),
+            dt,
+            title_short
+        );
+    }
+    Ok(())
+}
+
+/// `tmoe history show <feature_id>`: feature の 3 view brief と raw_node 数を印字する。
+pub fn history_show(cfg: &Config, feature_id: &str) -> Result<()> {
+    let store = HistoryStore::open(&cfg.history_root)
+        .with_context(|| format!("open history at {}", cfg.history_root.display()))?;
+    let feature = store
+        .get_feature(feature_id)
+        .with_context(|| format!("feature {feature_id} not found"))?;
+    let raws = store.list_raw(&feature.id).unwrap_or_default();
+    println!("feature_id:  {}", feature.id);
+    println!("title:       {}", feature.title);
+    println!("status:      {:?}", feature.status);
+    println!("created_at:  {}", chrono_like(feature.created_at));
+    println!("raw_nodes:   {}", raws.len());
+    println!();
+    for view in [AgentView::Worker, AgentView::Supervisor, AgentView::Observer] {
+        println!("--- {} view (latest level=0) ---", view.as_str());
+        match store.latest_level0(&feature.id, view) {
+            Ok(Some(node)) => {
+                println!("{}", node.summary.trim());
+            }
+            Ok(None) => println!("(empty)"),
+            Err(e) => println!("(error: {e})"),
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn chrono_like(unix_secs: i64) -> String {
+    // 外部 crate を増やさないため SystemTime ベースの簡易フォーマット。
+    // YYYY-MM-DD HH:MM:SS (UTC)。`chrono` を入れる価値はあるが履歴表示の数行のためだけに入れない。
+    let secs = unix_secs.max(0) as u64;
+    let days = secs / 86_400;
+    let hms = secs % 86_400;
+    // unix epoch: 1970-01-01。簡易にうるう年計算。
+    let mut y: i64 = 1970;
+    let mut d_left = days as i64;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        let yd = if leap { 366 } else { 365 };
+        if d_left < yd {
+            break;
+        }
+        d_left -= yd;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    while m < 12 && d_left >= mdays[m] {
+        d_left -= mdays[m];
+        m += 1;
+    }
+    let day = (d_left + 1) as u32;
+    let h = (hms / 3600) as u32;
+    let mi = ((hms % 3600) / 60) as u32;
+    let s = (hms % 60) as u32;
+    format!("{y:04}-{:02}-{day:02} {h:02}:{mi:02}:{s:02}", m + 1)
 }
 
 /// プロンプトが Worker に告知している全ツールを 1 箇所で登録する。
