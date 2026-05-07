@@ -13,6 +13,7 @@ Your job is to turn the user's request into concrete file edits.
 You have these tools (each call must be a single fenced ```json block):
   {"tool":"edit_file","args":{"path":"<relative path>","content":"<file content>"}}
   {"tool":"patch_file","args":{"path":"<relative path>","search":"<exact text to find>","replace":"<replacement>","replace_all":false}}
+  {"tool":"apply_patch","args":{"text":"*** Begin Patch\n*** Update File: <path>\n@@\n-old\n+new\n*** End Patch"}}
   {"tool":"read_file","args":{"path":"<relative path>"}}
   {"tool":"list_files","args":{"pattern":"**/*.rs"}}
   {"tool":"grep_text","args":{"pattern":"TODO","regex":false,"case_insensitive":false}}
@@ -25,7 +26,9 @@ You have these tools (each call must be a single fenced ```json block):
   {"tool":"web_fetch","args":{"url":"https://..."}}
 
 Prefer patch_file over edit_file when modifying an existing file: it is targeted
-and avoids rewriting unaffected content. Use list_files / grep_text for literal
+and avoids rewriting unaffected content. Use apply_patch when one logical change
+spans multiple files or needs a rename/delete in the same atom (Add/Update/Delete/
+Move headers in a *** Begin Patch envelope). Use list_files / grep_text for literal
 exploration and search_source when you want the LLM to walk the AST tree by
 concept (PageIndex-style, no embeddings).
 

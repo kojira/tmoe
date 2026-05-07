@@ -36,9 +36,9 @@ use tmoe_history::{
 };
 use tmoe_llm::{ChatMessage, LlmClient, OpenAiCompatClient};
 use tmoe_tools::{
-    carve_worktree, cleanup_worktree, default_blocklist, git_commit, stage_all, EditFileTool,
-    GrepTextTool, ListFilesTool, PatchFileTool, ReadFileTool, RunCmdTool, ToolRegistry,
-    WebFetchTool, WebSearchTool, WorktreeHandle,
+    carve_worktree, cleanup_worktree, default_blocklist, git_commit, stage_all, ApplyPatchTool,
+    EditFileTool, GrepTextTool, ListFilesTool, PatchFileTool, ReadFileTool, RunCmdTool,
+    ToolRegistry, WebFetchTool, WebSearchTool, WorktreeHandle,
 };
 
 use crate::agents_md;
@@ -323,6 +323,8 @@ pub async fn run_feature(
          Available tools (call as a fenced ```json block with {{\"tool\":\"name\",\"args\":{{...}}}}):\n\
          - edit_file / read_file: full-file write or read\n\
          - patch_file: search/replace inside an existing file\n\
+         - apply_patch: multi-file structural change (Add/Update/Delete/Move) — \
+            args {{\"text\":\"*** Begin Patch\\n*** Update File: a.rs\\n@@\\n-old\\n+new\\n*** End Patch\"}}\n\
          - list_files: list workspace files (supports glob)\n\
          - grep_text: literal/regex search across files\n\
          - search_source: PageIndex-style AST search (LLM walks the source tree)\n\
@@ -873,6 +875,7 @@ pub fn build_tool_registry(root: PathBuf, llm: Arc<dyn LlmClient>) -> ToolRegist
     reg.register(Arc::new(ReadFileTool { root: root.clone() }));
     reg.register(Arc::new(EditFileTool { root: root.clone() }));
     reg.register(Arc::new(PatchFileTool { root: root.clone() }));
+    reg.register(Arc::new(ApplyPatchTool { root: root.clone() }));
     reg.register(Arc::new(ListFilesTool { root: root.clone() }));
     reg.register(Arc::new(GrepTextTool { root: root.clone() }));
     reg.register(Arc::new(RunCmdTool {
@@ -900,8 +903,8 @@ mod tests {
         let reg = build_tool_registry(dir.path().to_path_buf(), llm);
         let names = reg.names();
         for name in [
-            "read_file", "edit_file", "patch_file", "list_files", "grep_text",
-            "run_cmd", "web_search", "web_fetch", "search_source",
+            "read_file", "edit_file", "patch_file", "apply_patch", "list_files",
+            "grep_text", "run_cmd", "web_search", "web_fetch", "search_source",
         ] {
             assert!(
                 names.iter().any(|n| *n == name),
