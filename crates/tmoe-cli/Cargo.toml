@@ -27,6 +27,7 @@ toml.workspace = true
 dirs.workspace = true
 url.workspace = true
 git2.workspace = true
+async-trait.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]

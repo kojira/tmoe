@@ -32,6 +32,8 @@ use tmoe_tools::{
     ListFilesTool, PatchFileTool, ReadFileTool, RunCmdTool, ToolRegistry, WebFetchTool,
     WebSearchTool, WorktreeHandle,
 };
+
+use crate::source_tool::SearchSourceTool;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
@@ -53,8 +55,6 @@ pub struct RunOptions {
     pub use_worktree: bool,
     /// Commit 後に `gh pr create --draft` を試みる。gh が無ければスキップ + 警告。
     pub open_pr: bool,
-    /// Concierge から TUI を経由せず headless で動かすときの自動 thrust。
-    pub auto_go: bool,
 }
 
 /// 機能 1 件を最後まで駆動する。`thrust_rx` が None なら `auto_go` を見て
@@ -117,13 +117,13 @@ pub async fn run_feature(
         opts.workdir.clone()
     };
 
-    // --- 3) Tools (advertised in tmoe-prompts:WORKER_SYSTEM are ALL registered here)
-    let tools = build_tool_registry(work_root.clone());
-
-    // --- 4) LLM
+    // --- 4) LLM (LLM 駆動の検索ツールが LlmClient を保持するので tools 構築の前に作る)
     let llm: Arc<dyn LlmClient> = Arc::new(
         OpenAiCompatClient::new(cfg.llm.clone()).context("build OpenAI-compat LLM client")?,
     );
+
+    // --- 3) Tools (advertised in tmoe-prompts:WORKER_SYSTEM are ALL registered here)
+    let tools = build_tool_registry(work_root.clone(), llm.clone());
 
     // --- 5) Trio + ViewProvider
     let trio = Trio::from_shared_llm(llm.clone()).with_thresholds(ConsensusThresholds {
@@ -132,19 +132,14 @@ pub async fn run_feature(
         max_iter_per_step: cfg.trio.max_iter_per_step,
     });
 
-    // headless で起動された場合の自動 z_thrust。TUI 経由なら呼び出し側が事前に送る。
-    if opts.auto_go {
-        // ThrustReceiver は構造体内に sender 経路を持たないので、
-        // ここでは追加 send は出来ない。CLI 側で Go を流してから run_feature を呼ぶ。
-    }
-
     let messages = vec![ChatMessage::user(format!(
         "{task}\n\n\
          Available tools (call as a fenced ```json block with {{\"tool\":\"name\",\"args\":{{...}}}}):\n\
          - edit_file / read_file: full-file write or read\n\
          - patch_file: search/replace inside an existing file\n\
          - list_files: list workspace files (supports glob)\n\
-         - grep_text: search for substring or regex\n\
+         - grep_text: literal/regex search across files\n\
+         - search_source: PageIndex-style AST search (LLM walks the source tree)\n\
          - run_cmd: run a shell command (denylist enforced)\n\
          - web_search / web_fetch: optional, requires obscura on PATH\n\
          When you finish, emit a single line containing only DONE.",
@@ -312,7 +307,10 @@ fn is_git_repo(p: &Path) -> bool {
 
 /// プロンプトが Worker に告知している全ツールを 1 箇所で登録する。
 /// ここに登録されていないものは Worker が `{"tool": ...}` で呼んでも `unknown tool` で弾かれる。
-pub fn build_tool_registry(root: PathBuf) -> ToolRegistry {
+///
+/// `search_source` は tmoe-tree (AST 木) + tmoe-rag (LLM 駆動の木探索) の組合わせで動くので
+/// LlmClient を要求する。Phase 5 のライブラリが long unused にならないようここで結線する。
+pub fn build_tool_registry(root: PathBuf, llm: Arc<dyn LlmClient>) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(ReadFileTool { root: root.clone() }));
     reg.register(Arc::new(EditFileTool { root: root.clone() }));
@@ -325,6 +323,7 @@ pub fn build_tool_registry(root: PathBuf) -> ToolRegistry {
     }));
     reg.register(Arc::new(WebSearchTool::default()));
     reg.register(Arc::new(WebFetchTool::new()));
+    reg.register(Arc::new(SearchSourceTool::new(root, llm)));
     reg
 }
 
@@ -337,11 +336,12 @@ mod tests {
         // build_tool_registry が Worker プロンプトで宣伝しているツールを **全部**
         // 登録していることを保証する (= プロンプトが嘘をつかないことの最低保証)。
         let dir = tempfile::tempdir().unwrap();
-        let reg = build_tool_registry(dir.path().to_path_buf());
+        let llm: Arc<dyn LlmClient> = Arc::new(tmoe_llm::MockLlmClient::new("dummy"));
+        let reg = build_tool_registry(dir.path().to_path_buf(), llm);
         let names = reg.names();
         for name in [
             "read_file", "edit_file", "patch_file", "list_files", "grep_text",
-            "run_cmd", "web_search", "web_fetch",
+            "run_cmd", "web_search", "web_fetch", "search_source",
         ] {
             assert!(
                 names.iter().any(|n| *n == name),

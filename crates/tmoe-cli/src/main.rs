@@ -7,6 +7,7 @@ mod app;
 mod concierge;
 mod config;
 mod runtime;
+mod source_tool;
 
 use anyhow::{Context, Result};
 use app::App;
@@ -68,6 +69,12 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             _ => positional.push(s.clone()),
         }
         i += 1;
+    }
+    // 互換性: 1 つ目の positional が "ask" の場合は subcommand verb として読み捨て、
+    // 残りをタスク文字列にする。DESIGN.md は `tmoe ask "..."` と書いているため、その表記でも
+    // 動くようにしておく (素の `tmoe "<task>"` も従来通り動く)。
+    if positional.first().map(|s| s.as_str()) == Some("ask") {
+        positional.remove(0);
     }
     if !positional.is_empty() {
         a.task = Some(positional.join(" "));
@@ -178,7 +185,6 @@ async fn run_headless(
                 workdir,
                 use_worktree,
                 open_pr,
-                auto_go: true,
             },
             thrust_rx,
             Some(event_tx),
@@ -259,7 +265,6 @@ fn tui_loop<B: ratatui::backend::Backend>(
                     workdir: workdir_c,
                     use_worktree: flags.use_worktree,
                     open_pr: flags.open_pr,
-                    auto_go: false,
                 },
                 thrust_rx,
                 Some(etx),
@@ -417,5 +422,12 @@ mod tests {
     fn version_short() {
         let a = parse_args(&argv(&["-V"])).unwrap();
         assert!(a.show_version);
+    }
+
+    #[test]
+    fn ask_subcommand_alias() {
+        // DESIGN.md は `tmoe ask "..."` と書いているので、ask verb を読み捨てて同等にする。
+        let a = parse_args(&argv(&["ask", "rename foo to bar"])).unwrap();
+        assert_eq!(a.task.as_deref(), Some("rename foo to bar"));
     }
 }

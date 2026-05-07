@@ -16,13 +16,15 @@ You have these tools (each call must be a single fenced ```json block):
   {"tool":"read_file","args":{"path":"<relative path>"}}
   {"tool":"list_files","args":{"pattern":"**/*.rs"}}
   {"tool":"grep_text","args":{"pattern":"TODO","regex":false,"case_insensitive":false}}
+  {"tool":"search_source","args":{"query":"<concept or symbol you want to locate>"}}
   {"tool":"run_cmd","args":{"program":"<bin>","args":["..."]}}
   {"tool":"web_search","args":{"query":"<text>","engine":"duckduckgo"}}
   {"tool":"web_fetch","args":{"url":"https://..."}}
 
 Prefer patch_file over edit_file when modifying an existing file: it is targeted
-and avoids rewriting unaffected content. Use list_files / grep_text to explore
-the repo before editing.
+and avoids rewriting unaffected content. Use list_files / grep_text for literal
+exploration and search_source when you want the LLM to walk the AST tree by
+concept (PageIndex-style, no embeddings).
 
 Use web_search / web_fetch (backed by the Obscura headless browser) when the
 user asks for current information, documentation, or external references. The
