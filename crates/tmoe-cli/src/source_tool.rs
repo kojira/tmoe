@@ -14,7 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tmoe_llm::LlmClient;
 use tmoe_tools::{Permission, Tool, ToolError, ToolOutput, ToolResult};
-use tmoe_tree::{build_repo_tree, BuildOptions, SourceNode};
+use tmoe_tree::{
+    build_repo_tree, enrich_summaries, BuildOptions, EnrichOptions, InMemorySummaryCache,
+    SourceNode,
+};
 use tokio::sync::Mutex;
 
 pub struct SearchSourceTool {
@@ -22,7 +25,12 @@ pub struct SearchSourceTool {
     pub llm: Arc<dyn LlmClient>,
     pub max_depth: usize,
     pub max_results: usize,
+    /// 初回 build 後に LLM ベースのノード要約 (Function/Class/Module) を上書きする。
+    /// 既定 false (= 構造的フォールバック要約だけで動かす)。N 個のノードに対し N 回の
+    /// LLM 呼び出しが要るため、ローカル軽量モデルか opt-in 環境で使うことを想定。
+    pub enable_llm_summaries: bool,
     cache: Mutex<Option<SourceNode>>,
+    summary_cache: Arc<InMemorySummaryCache>,
 }
 
 impl SearchSourceTool {
@@ -32,8 +40,17 @@ impl SearchSourceTool {
             llm,
             max_depth: 4,
             max_results: 8,
+            enable_llm_summaries: false,
             cache: Mutex::new(None),
+            summary_cache: Arc::new(InMemorySummaryCache::new()),
         }
+    }
+
+    /// LLM 駆動の summary enrichment を有効化する (DESIGN.md「ボトムアップで Worker LLM に
+    /// 要約させて木を完成」の opt-in 実装)。
+    pub fn with_llm_summaries(mut self, on: bool) -> Self {
+        self.enable_llm_summaries = on;
+        self
     }
 
     /// テスト/特殊用途: 既に構築済みの SourceNode をキャッシュに直接注入する。
@@ -46,7 +63,9 @@ impl SearchSourceTool {
             llm,
             max_depth: 4,
             max_results: 8,
+            enable_llm_summaries: false,
             cache: Mutex::new(Some(tree)),
+            summary_cache: Arc::new(InMemorySummaryCache::new()),
         }
     }
 
@@ -71,8 +90,16 @@ impl SearchSourceTool {
                 ".tmoe-worktrees".into(),
             ],
         };
-        let tree = build_repo_tree(&opts)
+        let mut tree = build_repo_tree(&opts)
             .map_err(|e| ToolError::Args(format!("build source tree: {e}")))?;
+
+        if self.enable_llm_summaries {
+            let enrich_opts = EnrichOptions::new(self.root.clone());
+            // SummaryCache trait は Arc<dyn ...> 経由で注入する。
+            let cache_obj: Arc<dyn tmoe_tree::SummaryCache> = self.summary_cache.clone();
+            enrich_summaries(&mut tree, self.llm.clone(), cache_obj, &enrich_opts).await;
+        }
+
         *g = Some(tree.clone());
         Ok(tree)
     }

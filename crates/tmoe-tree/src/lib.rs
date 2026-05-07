@@ -5,10 +5,12 @@
 //! ベクトル類似度を使わないエージェンティック木探索検索 (tmoe-rag) の対象にする。
 
 pub mod build;
+pub mod enrich;
 pub mod node;
 pub mod parse;
 
 pub use build::{build_repo_tree, BuildOptions};
+pub use enrich::{enrich_summaries, EnrichOptions, InMemorySummaryCache, SummaryCache};
 pub use node::{NodeId, NodeKind, SourceNode};
 pub use parse::{
     available_languages, language_for_path, LanguageId, LanguageOps, ParseOutput,

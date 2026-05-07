@@ -1796,15 +1796,19 @@ name = "tmoe-tree"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "blake3",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tmoe-llm",
+ "tokio",
  "tree-sitter",
  "tree-sitter-python",
  "tree-sitter-rust",
  "ulid",
+ "url",
  "walkdir",
 ]
 

@@ -15,6 +15,11 @@ tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-python.workspace = true
 walkdir.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tmoe-llm.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+url.workspace = true

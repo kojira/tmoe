@@ -6,7 +6,8 @@
 //!   ③ Observer 警告 (右下)       — ループ・記憶ずれ・要件逸脱
 //!   ④ 機能ツリー (下部)           — feature 一覧
 //!
-//! `App` は表示専用状態。Trio との接続は別タスク (Phase 7 / e2e で組合せ)。
+//! `App` は表示専用状態。Trio との接続は `main.rs::tui_loop` が tokio::spawn で行い、
+//! `RuntimeEvent` を mpsc 経由で受信して各ペインに反映する。
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

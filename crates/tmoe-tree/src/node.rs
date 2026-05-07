@@ -21,7 +21,9 @@ pub struct SourceNode {
     pub start_line: u32,
     pub end_line: u32,
     pub children: Vec<SourceNode>,
-    /// LLM 要約。Phase 5 時点では決定的なフォールバック要約を入れる (Phase 後半で LLM 化)。
+    /// 要約。`build_repo_tree` は決定的な構造的要約 (kind + name + path + 公開子の名前リスト) を入れる。
+    /// 本物の LLM 駆動要約は `enrich_summaries_with_llm` (opt-in) でこのフィールドを上書きできる。
+    /// rag::search はこの文字列を navigate 判断材料に使うので、空でなければ何でも良い。
     pub summary: String,
     /// 本文 (このノードに対応するソース範囲) の BLAKE3 ハッシュ。
     pub content_hash: String,

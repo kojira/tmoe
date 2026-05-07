@@ -67,6 +67,7 @@ pub fn build_repo_tree(opts: &BuildOptions) -> anyhow::Result<SourceNode> {
             .unwrap_or_else(|_| path.display().to_string());
         let file_hash = blake3::hash(src.as_bytes()).to_hex().to_string();
         let line_count = src.lines().count() as u32;
+        let summary = file_summary(&rel, line_count, &parsed.roots);
         let file_node = SourceNode {
             id: ulid::Ulid::new().to_string(),
             kind: NodeKind::File,
@@ -75,13 +76,14 @@ pub fn build_repo_tree(opts: &BuildOptions) -> anyhow::Result<SourceNode> {
             start_line: 1,
             end_line: line_count.max(1),
             children: parsed.roots,
-            summary: format!("file {} ({} lines)", rel, line_count),
+            summary,
             content_hash: file_hash,
         };
         file_nodes.push(file_node);
         count += 1;
     }
     let combined_hash = combined_hash_of(&file_nodes);
+    let repo_summary = repo_summary(&root, &file_nodes);
     Ok(SourceNode {
         id: ulid::Ulid::new().to_string(),
         kind: NodeKind::Repo,
@@ -93,9 +95,53 @@ pub fn build_repo_tree(opts: &BuildOptions) -> anyhow::Result<SourceNode> {
         start_line: 0,
         end_line: 0,
         children: file_nodes,
-        summary: format!("repo at {} ({} files)", root.display(), count),
+        summary: repo_summary,
         content_hash: combined_hash,
     })
+}
+
+/// File ノードの構造的要約: 行数 + 直下の名前リスト (kind:name) を最大 12 件まで列挙する。
+/// rag::search の navigate-LLM がファイル単位で「どのファイルを開くか」を判断するときの
+/// 主要な手がかりになるため、最低でも子の名前 + kind を見せる。
+fn file_summary(path: &str, line_count: u32, children: &[SourceNode]) -> String {
+    let mut head = format!("file {path} ({line_count} lines)");
+    if children.is_empty() {
+        return head;
+    }
+    let entries: Vec<String> = children
+        .iter()
+        .take(12)
+        .map(|c| {
+            let kind = match c.kind {
+                NodeKind::Function => "fn",
+                NodeKind::Class => "class",
+                NodeKind::Module => "mod",
+                NodeKind::File => "file",
+                NodeKind::Repo => "repo",
+            };
+            format!("{kind}:{}", c.name)
+        })
+        .collect();
+    head.push_str(" — defines: ");
+    head.push_str(&entries.join(", "));
+    if children.len() > 12 {
+        head.push_str(&format!(" (+{} more)", children.len() - 12));
+    }
+    head
+}
+
+/// Repo ノードの構造的要約: ファイル数 + 上位 6 ファイルの相対パス。
+fn repo_summary(root: &Path, files: &[SourceNode]) -> String {
+    let mut head = format!("repo at {} ({} files)", root.display(), files.len());
+    if !files.is_empty() {
+        let names: Vec<&str> = files.iter().take(6).map(|f| f.name.as_str()).collect();
+        head.push_str(" — top: ");
+        head.push_str(&names.join(", "));
+        if files.len() > 6 {
+            head.push_str(&format!(" (+{} more)", files.len() - 6));
+        }
+    }
+    head
 }
 
 fn combined_hash_of(nodes: &[SourceNode]) -> String {
