@@ -77,7 +77,6 @@ async fn resume_pulls_three_view_briefs_into_worker_prompt() {
     //    本テストの目的は「prompt 構築ロジックが事前情報を正しく組み立てる」確認なので、
     //    HistoryViewProvider 経由で view brief が読み出せるか単体で代替検証する。
     let provider = tmoe_history::HistoryViewProvider::new(&store, f.id.clone());
-    use tmoe_history::ViewProvider;
     let block = tmoe_history::render_prior_views_block(&provider);
     assert!(block.contains("WVIEW_LEVENSHTEIN_DP_TABLE_DONE"));
     assert!(block.contains("SVIEW_REQUIRE_EMPTY_STR_GUARD"));
