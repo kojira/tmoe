@@ -42,6 +42,7 @@ use tmoe_tools::{
 };
 
 use crate::agents_md;
+use crate::history_tool::SearchHistoryTool;
 use crate::source_tool::SearchSourceTool;
 use tokio::sync::mpsc;
 
@@ -203,8 +204,16 @@ pub async fn run_feature(
         OpenAiCompatClient::new(cfg.llm.clone()).context("build OpenAI-compat LLM client")?,
     );
 
-    // --- 3) Tools
-    let tools = build_tool_registry(work_root.clone(), llm.clone());
+    // --- 3) Tools (search_history は HistoryStore + 現 feature_id を握る必要があるので、
+    //    feature 行が確定した後にここで上書き登録する)
+    let mut tools = build_tool_registry(work_root.clone(), llm.clone());
+    let history_arc = std::sync::Arc::new(
+        HistoryStore::open(&cfg.history_root)
+            .with_context(|| "open history for search_history tool")?,
+    );
+    tools.register(std::sync::Arc::new(
+        SearchHistoryTool::new(history_arc, llm.clone()).with_current_feature(feature.id.clone()),
+    ));
 
     // --- 5) Trio + ViewProvider
     let trio = Trio::from_shared_llm(llm.clone()).with_thresholds(ConsensusThresholds {
@@ -261,6 +270,8 @@ pub async fn run_feature(
          - list_files: list workspace files (supports glob)\n\
          - grep_text: literal/regex search across files\n\
          - search_source: PageIndex-style AST search (LLM walks the source tree)\n\
+         - search_history: Agentic RAG over past tmoe features (3-view summaries) — \
+            args {{\"query\":\"...\",\"agent\":\"worker|supervisor|observer|any\",\"scope\":\"all|current\"}}\n\
          - run_cmd: run a shell command (denylist enforced)\n\
          - web_search / web_fetch: optional, requires obscura on PATH\n\
          When you finish, emit a single line containing only DONE.",
@@ -817,6 +828,10 @@ mod tests {
 
     #[test]
     fn registry_includes_all_advertised_tools() {
+        // 注: search_history は run_feature が feature_id を確定したあとに register するので、
+        // build_tool_registry には含まれない。プロンプトに search_history が出ているのに
+        // registry に居ない、という嘘を防ぐため、search_history については別 e2e
+        // (history_tool::tests / integration) で覆う。
         let dir = tempfile::tempdir().unwrap();
         let llm: Arc<dyn LlmClient> = Arc::new(tmoe_llm::MockLlmClient::new("dummy"));
         let reg = build_tool_registry(dir.path().to_path_buf(), llm);

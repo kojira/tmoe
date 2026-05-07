@@ -17,6 +17,7 @@ You have these tools (each call must be a single fenced ```json block):
   {"tool":"list_files","args":{"pattern":"**/*.rs"}}
   {"tool":"grep_text","args":{"pattern":"TODO","regex":false,"case_insensitive":false}}
   {"tool":"search_source","args":{"query":"<concept or symbol you want to locate>"}}
+  {"tool":"search_history","args":{"query":"<what you want to recall from past features>","agent":"any","scope":"all"}}
   {"tool":"run_cmd","args":{"program":"<bin>","args":["..."]}}
   {"tool":"web_search","args":{"query":"<text>","engine":"duckduckgo"}}
   {"tool":"web_fetch","args":{"url":"https://..."}}
@@ -25,6 +26,13 @@ Prefer patch_file over edit_file when modifying an existing file: it is targeted
 and avoids rewriting unaffected content. Use list_files / grep_text for literal
 exploration and search_source when you want the LLM to walk the AST tree by
 concept (PageIndex-style, no embeddings).
+
+Use search_history before tackling a non-trivial task to recall whether tmoe
+already faced something similar in a past feature: the 3 personality views
+(Worker/Supervisor/Observer) are stored per feature, and search_history walks
+them via an LLM navigator. Setting agent=supervisor recalls past critique;
+agent=worker recalls past implementation traces; scope=current confines to
+the live feature.
 
 Use web_search / web_fetch (backed by the Obscura headless browser) when the
 user asks for current information, documentation, or external references. The
