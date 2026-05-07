@@ -20,6 +20,8 @@ You have these tools (each call must be a single fenced ```json block):
   {"tool":"search_source","args":{"query":"<concept or symbol you want to locate>"}}
   {"tool":"search_history","args":{"query":"<what you want to recall from past features>","agent":"any","scope":"all"}}
   {"tool":"question","args":{"questions":[{"question":"<text>","options":["yes","no"],"multiple":false}]}}
+  {"tool":"plan_enter","args":{"plan":"<markdown plan body>","title":"<optional title>"}}
+  {"tool":"plan_exit","args":{}}
   {"tool":"skill","args":{"name":"<skill name from the available skills list>"}}
   {"tool":"run_cmd","args":{"program":"<bin>","args":["..."]}}
   {"tool":"web_search","args":{"query":"<text>","engine":"duckduckgo"}}

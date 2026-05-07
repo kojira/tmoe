@@ -43,6 +43,7 @@ use tmoe_tools::{
 
 use crate::agents_md;
 use crate::history_tool::SearchHistoryTool;
+use crate::plan_tool::{PlanEnterTool, PlanExitTool};
 use crate::question_tool::{HeadlessAsker, QuestionAsker, QuestionTool};
 use crate::skill_tool::{SkillRegistry, SkillTool};
 use crate::source_tool::SearchSourceTool;
@@ -241,7 +242,20 @@ pub async fn run_feature(
         .question_asker
         .clone()
         .unwrap_or_else(|| Arc::new(HeadlessAsker));
-    tools.register(std::sync::Arc::new(QuestionTool::new(asker)));
+    tools.register(std::sync::Arc::new(QuestionTool::new(asker.clone())));
+
+    // plan_enter / plan_exit: plan モードの入口と出口。Worker が複雑タスクで使う。
+    // plan_enter は markdown を `<work_root>/.tmoe/plans/<feature_id>.md` に保存し、
+    // plan_exit は同じ asker (TUI ChannelAsker / Headless / Scripted) で user に承認を取る。
+    tools.register(std::sync::Arc::new(PlanEnterTool {
+        workdir: work_root.clone(),
+        feature_id: feature.id.clone(),
+    }));
+    tools.register(std::sync::Arc::new(PlanExitTool {
+        workdir: work_root.clone(),
+        feature_id: feature.id.clone(),
+        asker: asker.clone(),
+    }));
 
     // skill ツール: workdir / .claude / .agents / global の 4 階層を 1 度走査して登録。
     // 同名は workdir 系で global を上書きする。空でも tool 自体は registry に居る
@@ -333,6 +347,8 @@ pub async fn run_feature(
          - question: ask the user a clarifying question — \
             args {{\"questions\":[{{\"question\":\"...\",\"options\":[\"a\",\"b\"]}}]}} \
             (errors in --headless mode)\n\
+         - plan_enter / plan_exit: enter plan mode (write .tmoe/plans/<feature_id>.md) and \
+            exit by asking the user to approve. Use for multi-file or architectural work.\n\
          - skill: load a project-defined SKILL.md by name — \
             args {{\"name\":\"<skill name>\"}} (see the skills list below)\n\
          - run_cmd: run a shell command (denylist enforced)\n\
