@@ -13,7 +13,9 @@ tracing.workspace = true
 rusqlite.workspace = true
 ulid.workspace = true
 blake3.workspace = true
+async-trait.workspace = true
+tmoe-llm.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

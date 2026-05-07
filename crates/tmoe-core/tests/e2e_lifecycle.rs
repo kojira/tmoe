@@ -102,7 +102,9 @@ DONE"#,
         })
         .unwrap();
     let lenses = lenses();
-    let updated = compact_turn_for_all(&store, &f.id, &raw, raw_body, &lenses).unwrap();
+    let updated = compact_turn_for_all(&store, &f.id, &raw, raw_body, &lenses)
+        .await
+        .unwrap();
     assert_eq!(updated.len(), 3);
     let w = store.latest_level0(&f.id, AgentView::Worker).unwrap().unwrap();
     let p = store.latest_level0(&f.id, AgentView::Supervisor).unwrap().unwrap();

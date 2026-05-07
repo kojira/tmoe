@@ -127,10 +127,46 @@ impl Tool for PatchFileTool {
         let original = tokio::fs::read_to_string(&path).await?;
         let occurrences = original.matches(&a.search).count();
         if occurrences == 0 {
+            // actionable な error: search の最初の 1 行をヒントにファイルから候補行を抽出する。
+            // LLM が次ターンで正しい search を組み立てるための素材を返す。
+            let hint_seed = a
+                .search
+                .lines()
+                .next()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty());
+            let mut candidates: Vec<(usize, &str)> = Vec::new();
+            if let Some(seed) = hint_seed {
+                let key = if seed.len() > 8 {
+                    // search の冒頭 8 文字以上は安定した手がかりになる
+                    &seed[..8.min(seed.len())]
+                } else {
+                    seed
+                };
+                for (i, line) in original.lines().enumerate() {
+                    if line.contains(key) {
+                        candidates.push((i + 1, line));
+                        if candidates.len() >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+            let hint = if candidates.is_empty() {
+                String::from("(no similar lines found; try a shorter or single-token search)")
+            } else {
+                let lines: Vec<String> = candidates
+                    .iter()
+                    .map(|(n, l)| format!("  {n}: {}", l.trim_end()))
+                    .collect();
+                format!("similar lines in current file:\n{}", lines.join("\n"))
+            };
             return Err(ToolError::Args(format!(
-                "patch_file: search not found in {} ({} byte search string)",
+                "patch_file: search not found in {} ({} byte search string).\n\
+                 Tip: prefer a short bare-token search (e.g. \"old_name\") with replace_all=true; \
+                 multi-line spans often mismatch on whitespace.\n{hint}",
                 a.path,
-                a.search.len()
+                a.search.len(),
             )));
         }
         if !a.replace_all && occurrences > 1 {

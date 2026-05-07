@@ -27,7 +27,7 @@ fn lenses() -> Vec<Box<dyn AgentLens>> {
     ]
 }
 
-fn ingest(store: &HistoryStore, feature_id: &str, body: &str) {
+async fn ingest(store: &HistoryStore, feature_id: &str, body: &str) {
     let raw = store
         .append_raw(AppendRaw {
             feature_id: feature_id.to_string(),
@@ -36,7 +36,9 @@ fn ingest(store: &HistoryStore, feature_id: &str, body: &str) {
             body: body.to_string(),
         })
         .unwrap();
-    compact_turn_for_all(store, feature_id, &raw, body, &lenses()).unwrap();
+    compact_turn_for_all(store, feature_id, &raw, body, &lenses())
+        .await
+        .unwrap();
 }
 
 fn view(store: &HistoryStore, feature_id: &str, agent: AgentView) -> String {
@@ -47,21 +49,21 @@ fn view(store: &HistoryStore, feature_id: &str, agent: AgentView) -> String {
         .unwrap_or_default()
 }
 
-#[test]
-fn two_features_have_strictly_disjoint_three_view_indexes() {
+#[tokio::test]
+async fn two_features_have_strictly_disjoint_three_view_indexes() {
     let (_d, s) = open();
     let fa = s.create_feature("add gcd").unwrap();
     let fb = s.create_feature("levenshtein util").unwrap();
 
     // Feature A — gcd を進める内容を 3 ターン
-    ingest(&s, &fa.id, "implement gcd via euclid");
-    ingest(&s, &fa.id, "must validate non-zero divisor for gcd");
-    ingest(&s, &fa.id, "user wants gcd as math util");
+    ingest(&s, &fa.id, "implement gcd via euclid").await;
+    ingest(&s, &fa.id, "must validate non-zero divisor for gcd").await;
+    ingest(&s, &fa.id, "user wants gcd as math util").await;
 
     // Feature B — levenshtein を進める内容を 3 ターン
-    ingest(&s, &fb.id, "implement levenshtein with DP table");
-    ingest(&s, &fb.id, "must guard against empty string in levenshtein");
-    ingest(&s, &fb.id, "user wants levenshtein for fuzzy match");
+    ingest(&s, &fb.id, "implement levenshtein with DP table").await;
+    ingest(&s, &fb.id, "must guard against empty string in levenshtein").await;
+    ingest(&s, &fb.id, "user wants levenshtein for fuzzy match").await;
 
     for agent in AgentView::all() {
         let a = view(&s, &fa.id, agent).to_lowercase();
@@ -85,8 +87,8 @@ fn two_features_have_strictly_disjoint_three_view_indexes() {
     }
 }
 
-#[test]
-fn three_views_partition_a_mixed_raw_stream() {
+#[tokio::test]
+async fn three_views_partition_a_mixed_raw_stream() {
     // 同じ feature に対し、実装・規範・意図が混じった 6 ターンを流す。
     // 各 view が自分のパーソナリティ語彙だけを拾い、他の view の語彙は拾わないことを検証する。
     let (_d, s) = open();
@@ -107,7 +109,7 @@ fn three_views_partition_a_mixed_raw_stream() {
         "context: avoid loop with same divisor pair",
     ];
     for body in stream {
-        ingest(&s, &f.id, body);
+        ingest(&s, &f.id, body).await;
     }
 
     let w = view(&s, &f.id, AgentView::Worker).to_lowercase();
@@ -157,8 +159,8 @@ fn three_views_partition_a_mixed_raw_stream() {
     assert_ne!(w, o, "worker and observer views collapsed");
 }
 
-#[test]
-fn supervisor_view_remains_critique_only_across_many_turns() {
+#[tokio::test]
+async fn supervisor_view_remains_critique_only_across_many_turns() {
     // ターンを重ねても Supervisor の視点が拡散せず、規範・整合に絞られたままであることを確認。
     let (_d, s) = open();
     let f = s.create_feature("long-running feature").unwrap();
@@ -179,7 +181,7 @@ fn supervisor_view_remains_critique_only_across_many_turns() {
         ("obs",    "context: divisions are out of scope for now"),
     ];
     for (_role, body) in stream {
-        ingest(&s, &f.id, body);
+        ingest(&s, &f.id, body).await;
     }
 
     let p = view(&s, &f.id, AgentView::Supervisor).to_lowercase();
