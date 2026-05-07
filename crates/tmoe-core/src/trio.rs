@@ -9,7 +9,7 @@
 //! 多数決ではない: 1 人でも反対していれば前進しない。
 //! 平面が均整していても Z が無ければ park し、Concierge は常時受付可能のまま入力を待つ。
 
-use crate::agent::{parse_proposal, single_agent_loop, AgentRole};
+use crate::agent::{single_agent_loop, AgentRole};
 use crate::proposal::Proposal;
 use crate::thrust::{ThrustReceiver, UserThrust};
 use crate::vote::{triangle_balance, Vote};
@@ -231,7 +231,7 @@ impl Trio {
             // 4) Z 軸推進を確認。drain して最新のシグナルを採用。
             let z = drain_thrust(thrust_rx);
             match z {
-                ZNet::GoPositive(_) => {
+                ZNet::GoPositive => {
                     return Ok(TrioOutcome {
                         steps,
                         last: ConsensusOutcome::Commit {
@@ -272,21 +272,22 @@ impl Trio {
     }
 }
 
-#[allow(dead_code)]
 enum ZNet {
     None,
-    GoPositive(f32),
+    GoPositive,
     Pause,
     Redirect(String),
     Stop,
 }
 
 /// 受信キューから最新の thrust を取り出す。複数あれば最後のものが勝つ。
+/// `Go { strength }` は `strength > 0.0` のときだけ前進と扱う (= Z 軸の符号判定)。
+/// 大きさ自体は現在の前進判定では使わない (バイナリ go/no-go)。
 fn drain_thrust(rx: &mut ThrustReceiver) -> ZNet {
     let mut latest = ZNet::None;
     while let Ok(t) = rx.0.try_recv() {
         latest = match t {
-            UserThrust::Go { strength } if strength > 0.0 => ZNet::GoPositive(strength),
+            UserThrust::Go { strength } if strength > 0.0 => ZNet::GoPositive,
             UserThrust::Go { .. } => ZNet::Pause,
             UserThrust::Pause => ZNet::Pause,
             UserThrust::Redirect { instruction } => ZNet::Redirect(instruction),
@@ -383,12 +384,6 @@ fn infer_approval_from_prose(text: &str) -> Option<bool> {
         return Some(true);
     }
     None
-}
-
-// proposal を再パースしたい場合の薄いヘルパ (Phase 5 以降で使用予定)。
-#[allow(dead_code)]
-fn refresh_proposal(text: &str) -> Proposal {
-    parse_proposal(text)
 }
 
 #[cfg(test)]
