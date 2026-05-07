@@ -103,6 +103,7 @@ impl Config {
             "rapid_mlx" => Backend::RapidMlx,
             "openai_compat" => Backend::OpenAiCompat,
             "llama_cpp" => Backend::LlamaCpp,
+            "codex" => Backend::Codex,
             other => anyhow::bail!("unknown llm.backend: {other}"),
         };
         let base_str = raw
@@ -132,6 +133,7 @@ impl Config {
             api_key,
             request_timeout_secs: raw.llm.request_timeout_secs,
             retry_max_attempts: raw.llm.retry_max_attempts,
+            codex_auth_path: None,
         };
         let trio = TrioCfg {
             confidence_sum_min: raw.trio.confidence_sum_min.unwrap_or(1.5),

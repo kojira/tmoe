@@ -675,6 +675,39 @@ pub async fn doctor(cfg: &Config) -> Result<bool> {
         desc.speculative_enabled
     );
 
+    // Backend::Codex の場合、auth.json の有無 + 期限を健診に含める。
+    if cfg.llm.backend == tmoe_llm::Backend::Codex {
+        let auth_path = cfg
+            .llm
+            .codex_auth_path
+            .clone()
+            .unwrap_or_else(tmoe_llm::default_auth_path);
+        match tmoe_llm::load_codex_auth(&auth_path) {
+            Ok(Some(a)) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let remaining = a.expires_at_unix.saturating_sub(now);
+                println!(
+                    "codex auth:   ok (account_id={}, access_expires_in={}s, file={})",
+                    a.account_id.as_deref().unwrap_or("<none>"),
+                    remaining,
+                    auth_path.display()
+                );
+            }
+            Ok(None) => {
+                println!(
+                    "codex auth:   MISSING — run `tmoe codex login` (file: {})",
+                    auth_path.display()
+                );
+            }
+            Err(e) => {
+                println!("codex auth:   ERROR loading {}: {e}", auth_path.display());
+            }
+        }
+    }
+
     let mut all_green = true;
     print!("LLM /v1/models: ");
     match client.health_check().await {

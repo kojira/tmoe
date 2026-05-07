@@ -36,6 +36,7 @@ async fn real_llm_worker_invokes_plan_enter_then_plan_exit() {
         api_key: None,
         request_timeout_secs: Some(120),
         retry_max_attempts: Some(0),
+        codex_auth_path: None,
     };
     let llm: Arc<dyn LlmClient> = Arc::new(OpenAiCompatClient::new(cfg).unwrap());
 

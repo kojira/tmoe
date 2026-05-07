@@ -6,8 +6,11 @@
 # TMOE_LLM_API_KEY) でも個別に上書きできる。
 
 [llm]
-# backend: llama_cpp | vllm | lm_studio | rapid_mlx | openai_compat
+# backend: llama_cpp | vllm | lm_studio | rapid_mlx | openai_compat | codex
 # 既定 (= 何も書かないとき) は rapid_mlx (Apple Silicon 向け headless LLM)。
+# `codex` を選ぶと ChatGPT Pro/Plus サブスクの OAuth 認証を使う。
+# 事前に `tmoe codex login` を 1 度実行して `~/.tmoe/auth.json` を作っておくこと。
+# このとき `base_url` は無視され、`https://chatgpt.com/backend-api/codex/responses` 固定。
 backend = "rapid_mlx"
 base_url = "http://127.0.0.1:8081/v1"
 api_key = ""

@@ -38,6 +38,7 @@ async fn real_llm_enriches_function_summaries() {
         api_key: None,
             request_timeout_secs: None,
             retry_max_attempts: None,
+        codex_auth_path: None,
     };
     let llm: Arc<dyn LlmClient> = Arc::new(OpenAiCompatClient::new(cfg).unwrap());
 

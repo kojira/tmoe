@@ -8,6 +8,10 @@ pub enum Backend {
     LmStudio,
     RapidMlx,
     OpenAiCompat,
+    /// ChatGPT Pro/Plus サブスクで OpenAI Codex のレスポンス API を使うバックエンド。
+    /// 認証は OAuth (= `codex.rs` に実装)。`base_url` は無視され、内部で
+    /// `https://chatgpt.com/backend-api/codex/responses` に固定される。
+    Codex,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

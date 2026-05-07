@@ -39,6 +39,7 @@ struct Args {
     subcommand_doctor: bool,
     subcommand_history: Option<HistorySub>,
     subcommand_merge: Option<String>,
+    subcommand_codex_login: bool,
     resume_feature_id: Option<String>,
 }
 
@@ -110,6 +111,18 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         positional.remove(0);
         a.resume_feature_id = Some(id);
     }
+    // `tmoe codex login` — ChatGPT Pro/Plus サブスクの OAuth をその場で完了させる。
+    if positional.first().map(|s| s.as_str()) == Some("codex") {
+        positional.remove(0);
+        match positional.first().map(|s| s.as_str()) {
+            Some("login") => {
+                positional.remove(0);
+                a.subcommand_codex_login = true;
+            }
+            Some(other) => anyhow::bail!("unknown codex subcommand: {other}"),
+            None => anyhow::bail!("usage: tmoe codex login"),
+        }
+    }
     // `tmoe history list` / `tmoe history show <id>`
     if positional.first().map(|s| s.as_str()) == Some("history") {
         positional.remove(0);
@@ -176,6 +189,10 @@ async fn main() -> Result<()> {
         let ok = doctor(&cfg).await?;
         std::process::exit(if ok { 0 } else { 1 });
     }
+    if args.subcommand_codex_login {
+        tmoe_cli::codex_login::run_login(None).await?;
+        return Ok(());
+    }
     if let Some(sub) = args.subcommand_history.clone() {
         match sub {
             HistorySub::List => history_list(&cfg)?,
@@ -222,6 +239,7 @@ fn print_help() {
     println!("    tmoe history show <feature_id>");
     println!("    tmoe resume <feature_id> [follow-up text...]");
     println!("    tmoe merge <feature_id>  — git merge --no-ff tmoe/feature/<id>");
+    println!("    tmoe codex login    — log in to ChatGPT Pro/Plus to use the Codex backend");
     println!("    tmoe                — start the TUI without a task");
     println!("    tmoe --version      — print version");
     println!();

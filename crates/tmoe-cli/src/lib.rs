@@ -6,6 +6,7 @@
 
 pub mod agents_md;
 pub mod app;
+pub mod codex_login;
 pub mod concierge;
 pub mod config;
 pub mod history_tool;

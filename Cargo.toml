@@ -55,3 +55,6 @@ crossterm = "0.28"
 git2 = { version = "0.19", default-features = false, features = ["vendored-openssl"] }
 toml = "0.8"
 dirs = "5"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"

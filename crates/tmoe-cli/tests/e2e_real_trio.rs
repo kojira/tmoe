@@ -41,6 +41,7 @@ fn config_from_env() -> Option<OpenAiCompatConfig> {
         api_key: env::var("TMOE_E2E_LLM_API_KEY").ok(),
             request_timeout_secs: None,
             retry_max_attempts: None,
+        codex_auth_path: None,
     })
 }
 

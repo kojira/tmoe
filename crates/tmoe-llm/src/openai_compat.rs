@@ -6,6 +6,9 @@
 //! `main_model` 単独で動作する (no-op フォールバック)。
 
 use crate::client::LlmClient;
+use crate::codex::{
+    self, default_auth_path, load_codex_auth, refresh_access_token, save_codex_auth, CodexAuth,
+};
 use crate::error::{LlmError, Result};
 use crate::types::{Backend, BackendCapabilities, ChatDelta, ChatRequest, ChatResponse, Usage};
 use async_trait::async_trait;
@@ -13,8 +16,11 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::sync::Mutex;
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -31,6 +37,9 @@ pub struct OpenAiCompatConfig {
     /// 一過性エラー (timeout / 接続切断 / 5xx) のときの再試行回数。0 なら無効。
     /// 既定は 3 (= 250ms → 500ms → 1s の指数バックオフ)。
     pub retry_max_attempts: Option<u32>,
+    /// `Backend::Codex` のときに使う auth.json のパス。None なら `~/.tmoe/auth.json`。
+    /// テストでは `tempdir` を渡してホーム汚染を避ける。
+    pub codex_auth_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +47,9 @@ pub struct OpenAiCompatClient {
     config: OpenAiCompatConfig,
     capabilities: BackendCapabilities,
     http: reqwest::Client,
+    /// Backend::Codex のときに保持する OAuth 認証情報。リクエスト時に必要なら refresh される。
+    /// 起動時に load し、各リクエスト直前で expires をチェック。
+    codex_auth: Arc<Mutex<Option<CodexAuth>>>,
 }
 
 /// `OpenAiCompatClient::health_check` の結果。
@@ -72,7 +84,24 @@ impl OpenAiCompatClient {
             supports_speculative: backend_supports_speculative(config.backend)
                 && config.draft_model.is_some(),
         };
-        Ok(Self { config, capabilities, http })
+        // Backend::Codex のみ初期 auth ファイルをロードする。失敗 (= 未ログイン) は
+        // ここではエラーにせず、最初の chat() 呼び出し時に "Codex not authenticated" として
+        // 表面化させる。これで health_check / describe は OAuth 未設定でも動かせる。
+        let codex_auth = if config.backend == Backend::Codex {
+            let path = config
+                .codex_auth_path
+                .clone()
+                .unwrap_or_else(default_auth_path);
+            load_codex_auth(&path).ok().flatten()
+        } else {
+            None
+        };
+        Ok(Self {
+            config,
+            capabilities,
+            http,
+            codex_auth: Arc::new(Mutex::new(codex_auth)),
+        })
     }
 
     pub fn with_capabilities(mut self, caps: BackendCapabilities) -> Self {
@@ -133,12 +162,52 @@ impl OpenAiCompatClient {
     }
 
     fn chat_url(&self) -> Result<Url> {
+        if self.config.backend == Backend::Codex {
+            // Codex は OpenAI の通常 OpenAI 互換ではなく、ChatGPT 用の専用エンドポイントを
+            // 使う。base_url の値は無視する。
+            return Url::parse(codex::CODEX_API_ENDPOINT).map_err(LlmError::from);
+        }
         // base_url は通常 .../v1 で終わる。chat/completions を後置する。
         let mut joined = self.config.base_url.clone();
         if !joined.path().ends_with('/') {
             joined.set_path(&format!("{}/", joined.path()));
         }
         joined.join("chat/completions").map_err(LlmError::from)
+    }
+
+    /// Backend::Codex のとき、有効な access_token を返す。失効していれば refresh して保存する。
+    /// 戻り値は (access_token, account_id?)。Backend::Codex 以外なら `Ok(None)` を返す。
+    async fn codex_credentials(&self) -> Result<Option<(String, Option<String>)>> {
+        if self.config.backend != Backend::Codex {
+            return Ok(None);
+        }
+        let path = self
+            .config
+            .codex_auth_path
+            .clone()
+            .unwrap_or_else(default_auth_path);
+        let mut guard = self.codex_auth.lock().await;
+        if guard.is_none() {
+            *guard = load_codex_auth(&path).ok().flatten();
+        }
+        let auth = guard.as_ref().ok_or_else(|| {
+            LlmError::Other(format!(
+                "Codex not authenticated. Run `tmoe codex login` first (auth file: {})",
+                path.display()
+            ))
+        })?;
+        if auth.needs_refresh_now() {
+            tracing::info!("refreshing codex access token");
+            let tr = refresh_access_token(&self.http, &auth.refresh_token).await?;
+            let next = codex::token_response_to_auth(&tr, auth.account_id.clone());
+            // ベストエフォートで保存。書けなくても session 内のメモリ更新は反映される。
+            if let Err(e) = save_codex_auth(&path, &next) {
+                tracing::warn!("failed to persist refreshed codex auth: {e}");
+            }
+            *guard = Some(next.clone());
+            return Ok(Some((next.access_token, next.account_id)));
+        }
+        Ok(Some((auth.access_token.clone(), auth.account_id.clone())))
     }
 
     fn build_request_body(&self, req: &ChatRequest, stream: bool) -> serde_json::Value {
@@ -172,6 +241,8 @@ fn backend_supports_speculative(backend: Backend) -> bool {
         Backend::RapidMlx => false,
         // 一般 OpenAI 互換はバックエンド次第のため既定 false。実環境で probe() してから上書き。
         Backend::OpenAiCompat => false,
+        // Codex (= ChatGPT 経由) は OAuth 認証が前提で、投機推論オプションは外向きには公開していない。
+        Backend::Codex => false,
     }
 }
 
@@ -190,10 +261,16 @@ impl OpenAiCompatClient {
         let body = self.build_request_body(&req, false);
         let mut attempt: u32 = 0;
         let max = self.retry_max();
+        let codex = self.codex_credentials().await?;
         loop {
             attempt += 1;
             let mut builder = self.http.post(url.clone()).json(&body).timeout(self.timeout());
-            if let Some(k) = &self.config.api_key {
+            if let Some((access, account)) = &codex {
+                builder = builder.bearer_auth(access).header("originator", "opencode");
+                if let Some(acct) = account {
+                    builder = builder.header("ChatGPT-Account-Id", acct);
+                }
+            } else if let Some(k) = &self.config.api_key {
                 builder = builder.bearer_auth(k);
             }
             let send = builder.send().await;
@@ -257,10 +334,16 @@ impl LlmClient for OpenAiCompatClient {
         let body = self.build_request_body(&req, true);
         let mut attempt: u32 = 0;
         let max = self.retry_max();
+        let codex = self.codex_credentials().await?;
         loop {
             attempt += 1;
             let mut builder = self.http.post(url.clone()).json(&body).timeout(self.timeout());
-            if let Some(k) = &self.config.api_key {
+            if let Some((access, account)) = &codex {
+                builder = builder.bearer_auth(access).header("originator", "opencode");
+                if let Some(acct) = account {
+                    builder = builder.header("ChatGPT-Account-Id", acct);
+                }
+            } else if let Some(k) = &self.config.api_key {
                 builder = builder.bearer_auth(k);
             }
             let resp = match builder.send().await {
@@ -503,6 +586,7 @@ mod tests {
             api_key: None,
             request_timeout_secs: None,
             retry_max_attempts: None,
+            codex_auth_path: None,
         }
     }
 
@@ -543,6 +627,60 @@ mod tests {
         let c = OpenAiCompatClient::new(cfg(Backend::LlamaCpp, None)).unwrap();
         let url = c.chat_url().unwrap();
         assert_eq!(url.as_str(), "http://127.0.0.1:8080/v1/chat/completions");
+    }
+
+    /// Backend::Codex は base_url を無視して chatgpt.com の codex/responses 固定エンドポイントへ
+    /// 行く。これが破綻すると OAuth 認証はあっても通信先が誤る。
+    #[test]
+    fn chat_url_for_codex_uses_chatgpt_endpoint_regardless_of_base_url() {
+        let c = OpenAiCompatClient::new(cfg(Backend::Codex, None)).unwrap();
+        let url = c.chat_url().unwrap();
+        assert_eq!(url.as_str(), "https://chatgpt.com/backend-api/codex/responses");
+    }
+
+    /// Backend::Codex の場合、auth.json が無い + 未指定なら chat() は明示的なメッセージで
+    /// 失敗する。これが沈黙すると初見ユーザーは「reqwest が刺さった」のような分かりにくい
+    /// エラーに遭遇する。
+    #[tokio::test]
+    async fn codex_credentials_errors_clearly_when_unauthenticated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(Backend::Codex, None);
+        config.codex_auth_path = Some(dir.path().join("nope.json"));
+        let c = OpenAiCompatClient::new(config).unwrap();
+        let err = c.codex_credentials().await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Codex not authenticated") && msg.contains("tmoe codex login"),
+            "expected hint message, got: {msg}"
+        );
+    }
+
+    /// auth.json があれば codex_credentials() は (access_token, account_id) を返す。
+    /// 期限が遠い未来ならリフレッシュは走らない (= ネットワークアクセスなし)。
+    #[tokio::test]
+    async fn codex_credentials_returns_token_when_fresh_auth_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let auth = crate::CodexAuth {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+            account_id: Some("acct_42".into()),
+        };
+        crate::save_codex_auth(&path, &auth).unwrap();
+
+        let mut config = cfg(Backend::Codex, None);
+        config.codex_auth_path = Some(path);
+        let c = OpenAiCompatClient::new(config).unwrap();
+        let creds = c.codex_credentials().await.unwrap();
+        assert_eq!(
+            creds,
+            Some(("AT".to_string(), Some("acct_42".to_string())))
+        );
     }
 
     #[test]
