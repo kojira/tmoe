@@ -1,0 +1,149 @@
+name: Release
+
+# `git tag v0.1.0 && git push origin v0.1.0` で起動。
+# macOS arm64 / macOS x86_64 / Linux x86_64 の 3 ターゲットでバイナリを焼き、
+# tar.gz + sha256 を GitHub Release に upload する。Homebrew tap (kojira/homebrew-tmoe)
+# の formula はこの Release から URL + sha256 を引いてくる前提。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "tag name to publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build tmoe-cli (release)
+        run: cargo build --release -p tmoe-cli --target ${{ matrix.target }} --locked
+
+      - name: Determine version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          TARGET="${{ matrix.target }}"
+          BIN_DIR="target/${TARGET}/release"
+          STAGE="$(mktemp -d)/tmoe-${TAG}-${TARGET}"
+          mkdir -p "$STAGE"
+          cp "${BIN_DIR}/tmoe" "$STAGE/"
+          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+          cp config/tmoe.toml.example "$STAGE/" 2>/dev/null || true
+          # strip (best effort; macOS strip is fine, Linux too)
+          strip "$STAGE/tmoe" || true
+          OUT="tmoe-${TAG}-${TARGET}.tar.gz"
+          tar -C "$(dirname "$STAGE")" -czf "$OUT" "$(basename "$STAGE")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$OUT" > "$OUT.sha256"
+          else
+            shasum -a 256 "$OUT" > "$OUT.sha256"
+          fi
+          ls -la "$OUT" "$OUT.sha256"
+          echo "ARTIFACT=$OUT" >> "$GITHUB_ENV"
+          echo "ARTIFACT_SHA=$OUT.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmoe-${{ steps.ver.outputs.tag }}-${{ matrix.target }}
+          path: |
+            ${{ env.ARTIFACT }}
+            ${{ env.ARTIFACT_SHA }}
+
+  release:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find dist -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -exec cp -v {} out/ \;
+          ls -la out/
+
+      - name: Build per-target SHA256 summary (for formula)
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## tmoe ${{ steps.ver.outputs.tag }} — Homebrew formula stanzas"
+            echo
+            echo '```ruby'
+            for f in out/*.tar.gz; do
+              base=$(basename "$f")
+              sha=$(awk '{print $1}' "$f.sha256")
+              echo "# $base"
+              echo "sha256 \"$sha\""
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            out/*.tar.gz
+            out/*.sha256

@@ -8,7 +8,19 @@
 
 ## クイックスタート (5 分で動かす)
 
-**前提**: macOS (Apple Silicon) または Linux + Rust 1.85+。LLM サーバーは tmoe には同梱しない。
+**前提**: macOS (Apple Silicon / Intel) または Linux x86_64。LLM サーバーは tmoe には同梱しない。
+
+### Homebrew で入れる (推奨)
+
+```bash
+brew tap kojira/tmoe
+brew install tmoe
+tmoe --version
+```
+
+### ソースからビルドする
+
+Rust 1.85+ が必要。
 
 ```bash
 # 1) clone & build
