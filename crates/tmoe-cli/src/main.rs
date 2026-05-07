@@ -40,6 +40,7 @@ struct Args {
     subcommand_history: Option<HistorySub>,
     subcommand_merge: Option<String>,
     subcommand_codex_login: bool,
+    subcommand_init: bool,
     resume_feature_id: Option<String>,
 }
 
@@ -111,6 +112,11 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         positional.remove(0);
         a.resume_feature_id = Some(id);
     }
+    // `tmoe init` — 初回セットアップウィザード (= ~/.tmoe/config.toml を生成)。
+    if positional.first().map(|s| s.as_str()) == Some("init") {
+        positional.remove(0);
+        a.subcommand_init = true;
+    }
     // `tmoe codex login` — ChatGPT Pro/Plus サブスクの OAuth をその場で完了させる。
     if positional.first().map(|s| s.as_str()) == Some("codex") {
         positional.remove(0);
@@ -174,7 +180,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let cfg = config::Config::load(args.config_path.as_deref())?;
+    let mut cfg = config::Config::load(args.config_path.as_deref())?;
     let workdir = args
         .workdir
         .clone()
@@ -183,12 +189,17 @@ async fn main() -> Result<()> {
     // 非 TUI な subcommand は stderr に tracing を出してよい (TUI と違って ratatui 描画なし)。
     if args.subcommand_doctor
         || args.subcommand_codex_login
+        || args.subcommand_init
         || args.subcommand_history.is_some()
         || args.subcommand_merge.is_some()
     {
         init_tracing_stderr();
     }
 
+    if args.subcommand_init {
+        tmoe_cli::setup::run_setup_wizard().await?;
+        return Ok(());
+    }
     if args.subcommand_doctor {
         let ok = doctor(&cfg).await?;
         std::process::exit(if ok { 0 } else { 1 });
@@ -207,6 +218,28 @@ async fn main() -> Result<()> {
     if let Some(id) = args.subcommand_merge.clone() {
         merge_feature(&cfg, &workdir, &id)?;
         return Ok(());
+    }
+
+    // ここから先は LLM が必要な経路 (TUI / headless / resume)。`~/.tmoe/config.toml` が
+    // 存在しない初回起動を救う:
+    //   - --config 明示指定 (= args.config_path) があればそれを尊重 (ユーザが分かってる)
+    //   - そうでなく TUI に入る予定なら setup ウィザードを自動起動して config を作る
+    //   - そうでなく headless で task が来てるなら、tmoe init を案内して exit する
+    if args.config_path.is_none() && !tmoe_cli::setup::config_exists() {
+        if args.headless {
+            anyhow::bail!(
+                "tmoe is not configured yet. Run `tmoe init` first to choose a backend, \
+                 or set TMOE_LLM_URL / TMOE_LLM_MODEL / TMOE_LLM_BACKEND env vars."
+            );
+        }
+        eprintln!(
+            "tmoe is not configured yet. Running `tmoe init` first..."
+        );
+        tmoe_cli::setup::run_setup_wizard().await?;
+        // ウィザード後は config を読み直す。Codex login が成功してれば即 TUI 起動に進める。
+        // Skip / Rapid-MLX セットアップだけだった場合も同様に進める (LLM が立ってなければ
+        // preflight が落ちて friendly hint を出す)。
+        cfg = config::Config::load(args.config_path.as_deref())?;
     }
 
     let flags = RunFlags {
@@ -255,6 +288,7 @@ fn print_help() {
     println!("USAGE:");
     println!("    tmoe [options] \"<task description>\"");
     println!("    tmoe ask \"<task>\"  — same as above (DESIGN-doc form)");
+    println!("    tmoe init           — first-run setup wizard (writes ~/.tmoe/config.toml)");
     println!("    tmoe doctor         — diagnose config + LLM reachability + optional bins");
     println!("    tmoe history list   — list past features stored in ~/.tmoe");
     println!("    tmoe history show <feature_id>");
