@@ -67,6 +67,20 @@ pub fn parse_proposal(text: &str) -> Proposal {
         }
     }
 
+    // フェンス無しで生 JSON object が text に含まれている (実機 LLM がフェンスを忘れる典型)
+    // ケースをすくい上げる。最初の `{` と最後の `}` の間を 1 つの候補として再パースする。
+    // 既に同じ ToolCall が抽出されている場合は重複追加しない。
+    if tool_calls.is_empty() {
+        if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
+            if end > start {
+                let candidate = &text[start..=end];
+                if let Some(call) = try_parse_tool_call(candidate) {
+                    tool_calls.push(call);
+                }
+            }
+        }
+    }
+
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed == "DONE" {
