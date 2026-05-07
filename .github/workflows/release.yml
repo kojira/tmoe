@@ -147,3 +147,80 @@ jobs:
           files: |
             out/*.tar.gz
             out/*.sha256
+
+      # Formula/tmoe.rb の `version` と各 `sha256` を、リリースした成果物の値に書き換えて
+      # main に commit + push する。これでユーザは `brew tap kojira/tmoe https://github.com/kojira/tmoe`
+      # → `brew upgrade tmoe` するだけで新版が降りてくる。tap 用の別リポは不要。
+      #
+      # commit message に `[skip ci]` を入れて再起動を防ぐ (release.yml は tags にしか
+      # 反応しないので元々ループしないが、将来 push トリガを足したときの保険)。
+      - name: Update Formula/tmoe.rb with new version + sha256s
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          VERSION="${TAG#v}"
+
+          # 各 target の sha256 を env vars に詰める (heredoc 内の bash 変数展開を避けて
+          # python は os.environ 経由で読む — シェルが意図せず interpolation するのを防ぐ)。
+          for f in out/*.tar.gz; do
+            base=$(basename "$f" .tar.gz)
+            target="${base#tmoe-${TAG}-}"
+            sha=$(awk '{print $1}' "$f.sha256")
+            echo "  $target -> $sha"
+            case "$target" in
+              aarch64-apple-darwin)     export SHA_ARM_MAC="$sha" ;;
+              x86_64-apple-darwin)      export SHA_INTEL_MAC="$sha" ;;
+              x86_64-unknown-linux-gnu) export SHA_LINUX="$sha" ;;
+              *) echo "::warning::unknown target $target — ignoring" ;;
+            esac
+          done
+          export VERSION
+
+          python3 - <<'PY'
+          import os, re, pathlib
+          path = pathlib.Path("Formula/tmoe.rb")
+          src = path.read_text()
+          version = os.environ["VERSION"]
+          shas = {
+              "aarch64-apple-darwin":     os.environ.get("SHA_ARM_MAC", ""),
+              "x86_64-apple-darwin":      os.environ.get("SHA_INTEL_MAC", ""),
+              "x86_64-unknown-linux-gnu": os.environ.get("SHA_LINUX", ""),
+          }
+
+          src, n = re.subn(
+              r'^(\s*version )"[^"]+"(\s*# tmoe:version)\s*$',
+              lambda m: f'{m.group(1)}"{version}"{m.group(2)}',
+              src,
+              flags=re.MULTILINE,
+          )
+          if n != 1:
+              raise SystemExit(f"version line not found (matches={n})")
+
+          for target, sha in shas.items():
+              if not sha:
+                  raise SystemExit(f"missing sha256 for target: {target}")
+              pat = re.compile(
+                  r'^(\s*sha256 )"[0-9a-fA-F]*"(\s*# tmoe:sha:' + re.escape(target) + r')\s*$',
+                  re.MULTILINE,
+              )
+              src, n = pat.subn(
+                  lambda m: f'{m.group(1)}"{sha}"{m.group(2)}',
+                  src,
+              )
+              if n != 1:
+                  raise SystemExit(f"failed to update sha for {target} (matches={n})")
+          path.write_text(src)
+          print("Formula/tmoe.rb updated for", version)
+          PY
+
+          git config user.name  "tmoe-release-bot"
+          git config user.email "tmoe-release-bot@users.noreply.github.com"
+          if git diff --quiet -- Formula/tmoe.rb; then
+            echo "Formula/tmoe.rb already at ${VERSION} — no commit"
+            exit 0
+          fi
+          git add Formula/tmoe.rb
+          git commit -m "Formula: bump tmoe to ${VERSION} [skip ci]"
+          # tag push は detached HEAD なので、明示的に main に push する。
+          git push origin "HEAD:refs/heads/main"

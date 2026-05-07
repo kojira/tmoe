@@ -1,18 +1,11 @@
 # Homebrew formula for tmoe.
 #
-# このファイルは `kojira/homebrew-tmoe` リポジトリの `Formula/tmoe.rb` に置いて
-# 配布する。tmoe 本体リポには参考用にコピーが残してある。
-#
-# 配布の流れ:
-#   1. tmoe 本体リポで `git tag v0.1.0 && git push origin v0.1.0`
-#   2. .github/workflows/release.yml が走り、3 ターゲットの tar.gz と sha256 が
-#      GitHub Release に上がる
-#   3. release ジョブの "Build per-target SHA256 summary (for formula)" ステップで
-#      `sha256 "..."` 行が job summary に出るので、それを下記の各 sha256 に貼り替え
-#   4. tap repo の `Formula/tmoe.rb` を更新 → `brew update && brew install kojira/tmoe/tmoe`
+# このリポ自体が tap として機能する (== 別 `homebrew-tmoe` リポは作らない設計)。
+# `version` と各 `sha256` は `git tag vX.Y.Z && git push origin vX.Y.Z` 後に
+# `.github/workflows/release.yml` が自動で書き戻す。手で触らなくてよい。
 #
 # ユーザ向け install 手順:
-#   brew tap kojira/tmoe
+#   brew tap kojira/tmoe https://github.com/kojira/tmoe
 #   brew install tmoe
 #   tmoe --version
 #
@@ -26,24 +19,24 @@
 class Tmoe < Formula
   desc "3-agent collaborative coding agent (Worker / Supervisor / Observer + user as Z-axis)"
   homepage "https://github.com/kojira/tmoe"
-  version "0.1.0"
+  version "0.1.0" # tmoe:version
   license "Apache-2.0"
 
   on_macos do
     on_arm do
       url "https://github.com/kojira/tmoe/releases/download/v#{version}/tmoe-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # tmoe:sha:aarch64-apple-darwin
     end
     on_intel do
       url "https://github.com/kojira/tmoe/releases/download/v#{version}/tmoe-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # tmoe:sha:x86_64-apple-darwin
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/kojira/tmoe/releases/download/v#{version}/tmoe-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "REPLACE_WITH_X86_64_LINUX_GNU_SHA256"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # tmoe:sha:x86_64-unknown-linux-gnu
     end
   end
 

@@ -13,10 +13,12 @@
 ### Homebrew で入れる (推奨)
 
 ```bash
-brew tap kojira/tmoe
+brew tap kojira/tmoe https://github.com/kojira/tmoe
 brew install tmoe
 tmoe --version
 ```
+
+> URL を明示するのは tmoe 本体リポをそのまま tap として使っているため (別 `homebrew-tmoe` リポは作らない設計)。一度 tap すればあとは `brew upgrade tmoe` で更新が降りてくる。
 
 ### ソースからビルドする
 
