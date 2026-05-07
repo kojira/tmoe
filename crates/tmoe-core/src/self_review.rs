@@ -24,7 +24,12 @@ pub async fn supervisor_review_diff(
          この diff を commit すべきかを JSON で返してください: {{\"approve\": bool, \"confidence\": 0.0-1.0, \"note\": \"...\"}}"
     )));
     let resp = supervisor_llm
-        .chat(ChatRequest { messages, ..Default::default() })
+        .chat(ChatRequest {
+            messages,
+            max_tokens: Some(256),
+            temperature: Some(0.0),
+            ..Default::default()
+        })
         .await?;
     let vote = parse_vote(&resp.content)
         .ok_or_else(|| anyhow::anyhow!("vote unparseable: {}", resp.content))?;

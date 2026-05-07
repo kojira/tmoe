@@ -459,9 +459,19 @@ pub async fn single_agent_loop_streaming(
     messages.push(ChatMessage::system(system));
     messages.extend(user_messages);
 
+    // Worker は "提案を出して DONE" で止まるはずだが、メタ質問など open-ended な入力では
+    // LLM が同じツール呼び出しを延々と stream し続けることがあるので max_tokens を必ず張る。
+    // 数千トークンあれば実用的な提案 (数〜十数個のツール呼び出し + DONE) は収まる。
+    let worker_chat_request = || ChatRequest {
+        messages: messages.clone(),
+        max_tokens: Some(4096),
+        temperature: Some(0.2),
+        ..Default::default()
+    };
+
     let content: String = if let Some(sink) = on_delta {
         let mut stream = llm
-            .chat_stream(ChatRequest { messages, ..Default::default() })
+            .chat_stream(worker_chat_request())
             .await?;
         let mut acc = String::new();
         while let Some(item) = stream.next().await {
@@ -481,7 +491,7 @@ pub async fn single_agent_loop_streaming(
         }
         acc
     } else {
-        llm.chat(ChatRequest { messages, ..Default::default() }).await?.content
+        llm.chat(worker_chat_request()).await?.content
     };
 
     let proposal = parse_proposal(&content);

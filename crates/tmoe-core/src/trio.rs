@@ -341,8 +341,16 @@ async fn ask_vote(
     messages.push(ChatMessage::user(
         r#"上記の提案に対し、JSON で {"approve": bool, "confidence": 0.0-1.0, "note": "..."} を返してください。"#,
     ));
+    // Supervisor / Observer は 1 行 JSON を返すだけなので小さく頑丈に絞る:
+    //   - max_tokens: 256 (verdict + note で十分)
+    //   - temperature: 0.0 (verdict は決定論的に)
     let resp = llm
-        .chat(tmoe_llm::ChatRequest { messages, ..Default::default() })
+        .chat(tmoe_llm::ChatRequest {
+            messages,
+            max_tokens: Some(256),
+            temperature: Some(0.0),
+            ..Default::default()
+        })
         .await?;
     parse_vote(&resp.content).ok_or_else(|| anyhow::anyhow!("vote not parseable: {}", resp.content))
 }
