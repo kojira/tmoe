@@ -11,4 +11,5 @@ pub mod config;
 pub mod history_tool;
 pub mod question_tool;
 pub mod runtime;
+pub mod skill_tool;
 pub mod source_tool;

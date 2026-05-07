@@ -44,6 +44,7 @@ use tmoe_tools::{
 use crate::agents_md;
 use crate::history_tool::SearchHistoryTool;
 use crate::question_tool::{HeadlessAsker, QuestionAsker, QuestionTool};
+use crate::skill_tool::{SkillRegistry, SkillTool};
 use crate::source_tool::SearchSourceTool;
 use tokio::sync::mpsc;
 
@@ -242,6 +243,15 @@ pub async fn run_feature(
         .unwrap_or_else(|| Arc::new(HeadlessAsker));
     tools.register(std::sync::Arc::new(QuestionTool::new(asker)));
 
+    // skill ツール: workdir / .claude / .agents / global の 4 階層を 1 度走査して登録。
+    // 同名は workdir 系で global を上書きする。空でも tool 自体は registry に居る
+    // (= worker が誤って呼んだ際の "available: (none)" を返すため)。
+    let home_dir = std::env::var("HOME").ok().map(PathBuf::from);
+    let skill_registry = Arc::new(SkillRegistry::scan(&work_root, home_dir.as_deref()));
+    tools.register(std::sync::Arc::new(SkillTool {
+        registry: skill_registry.clone(),
+    }));
+
     // --- 5) Trio + ViewProvider
     let trio = Trio::from_shared_llm(llm.clone()).with_thresholds(ConsensusThresholds {
         confidence_sum_min: cfg.trio.confidence_sum_min,
@@ -266,6 +276,11 @@ pub async fn run_feature(
     }
     let agents_block = agents_ctx.render_for_prompt();
 
+    if !skill_registry.is_empty() {
+        let names = skill_registry.names();
+        status(format!("skills loaded: {} ({})", names.len(), names.join(", ")));
+    }
+
     // Resume の場合は前回の 3 view brief を Worker に手渡す (= 「前回ここまでやった」)。
     let resume_block = if opts.resume_feature_id.is_some() {
         let mut s = String::from("RESUMING FEATURE — prior progress (3 personality views):\n\n");
@@ -289,6 +304,20 @@ pub async fn run_feature(
         opts.task.clone()
     };
 
+    // 利用可能な skill 一覧を 1 行ずつ "name — description" でプロンプトに埋め込む。
+    // 名前と要約だけ見せ、本文は worker が `{"tool":"skill","args":{"name":...}}` で
+    // 呼び出して始めて取り込む。これは Anthropic の "progressive disclosure" 思想と同じで、
+    // 全 SKILL.md 本文を最初から context に焼き付けると 1 機能あたりのトークンが膨れる。
+    let skills_block = if skill_registry.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("\nAvailable skills (load on demand via the `skill` tool):\n");
+        for info in skill_registry.list() {
+            s.push_str(&format!("  - {} — {}\n", info.name, info.description));
+        }
+        s
+    };
+
     let initial_prompt = format!(
         "{agents}{resume}{task}\n\n\
          Available tools (call as a fenced ```json block with {{\"tool\":\"name\",\"args\":{{...}}}}):\n\
@@ -302,12 +331,16 @@ pub async fn run_feature(
          - question: ask the user a clarifying question — \
             args {{\"questions\":[{{\"question\":\"...\",\"options\":[\"a\",\"b\"]}}]}} \
             (errors in --headless mode)\n\
+         - skill: load a project-defined SKILL.md by name — \
+            args {{\"name\":\"<skill name>\"}} (see the skills list below)\n\
          - run_cmd: run a shell command (denylist enforced)\n\
          - web_search / web_fetch: optional, requires obscura on PATH\n\
+         {skills}\n\
          When you finish, emit a single line containing only DONE.",
         agents = agents_block,
         resume = resume_block,
         task = task_line,
+        skills = skills_block,
     );
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(initial_prompt)];
     say("Trio starting (Worker / Supervisor / Observer)...".into());
