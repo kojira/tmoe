@@ -34,6 +34,27 @@ pub struct OpenAiCompatClient {
     http: reqwest::Client,
 }
 
+/// `OpenAiCompatClient::health_check` の結果。
+#[derive(Debug, Clone)]
+pub struct HealthStatus {
+    pub url: Url,
+    pub ok: bool,
+    pub status_code: u16,
+    /// `GET /v1/models` のレスポンスに、設定中の main_model 名が含まれていたか。
+    /// 一部バックエンドは ID を別表記で返すので false でも正常運転は可能。
+    pub main_model_visible: bool,
+    pub main_model: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientDescription {
+    pub backend: String,
+    pub base_url: String,
+    pub main_model: String,
+    pub draft_model: Option<String>,
+    pub speculative_enabled: bool,
+}
+
 impl OpenAiCompatClient {
     /// 設定からクライアントを構築。投機推論対応はバックエンド種別から推定する
     /// (本物の能力検出は probe() で行える)。
@@ -51,6 +72,58 @@ impl OpenAiCompatClient {
     pub fn with_capabilities(mut self, caps: BackendCapabilities) -> Self {
         self.capabilities = caps;
         self
+    }
+
+    /// OpenAI 互換の `<base_url>/models` を GET し、200 が返るかどうかを確認する。
+    /// `tmoe doctor` と runtime の preflight で使う。Trio を起動する前に LLM の生死を
+    /// 短い HTTP one-shot で確認することで、初見ユーザーが reqwest スタックトレースに
+    /// 直面するのを避ける。
+    pub async fn health_check(&self) -> Result<HealthStatus> {
+        let mut url = self.config.base_url.clone();
+        if !url.path().ends_with('/') {
+            url.set_path(&format!("{}/", url.path()));
+        }
+        let url = url.join("models").map_err(LlmError::from)?;
+        let mut builder = self.http.get(url.clone()).timeout(std::time::Duration::from_secs(3));
+        if let Some(k) = &self.config.api_key {
+            builder = builder.bearer_auth(k);
+        }
+        let resp = builder.send().await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let mut model_visible = false;
+        if status.is_success() {
+            // 設定されている main_model が GET /v1/models のレスポンスに含まれていれば
+            // 「ロード済み」の確度が上がる。含まれていなくても 200 なら HEALTH 自体は OK。
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                    model_visible = arr.iter().any(|m| {
+                        m.get("id")
+                            .and_then(|i| i.as_str())
+                            .map(|id| id == self.config.main_model)
+                            .unwrap_or(false)
+                    });
+                }
+            }
+        }
+        Ok(HealthStatus {
+            url,
+            ok: status.is_success(),
+            status_code: status.as_u16(),
+            main_model_visible: model_visible,
+            main_model: self.config.main_model.clone(),
+        })
+    }
+
+    /// 設定中の `(backend, base_url, main_model, draft_model)` を読み出す。doctor 用。
+    pub fn describe(&self) -> ClientDescription {
+        ClientDescription {
+            backend: format!("{:?}", self.config.backend),
+            base_url: self.config.base_url.to_string(),
+            main_model: self.config.main_model.clone(),
+            draft_model: self.config.draft_model.clone(),
+            speculative_enabled: self.capabilities.supports_speculative,
+        }
     }
 
     fn chat_url(&self) -> Result<Url> {

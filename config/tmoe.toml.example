@@ -1,36 +1,35 @@
 # tmoe configuration example
-# 実環境ではこのファイルを config/tmoe.toml にコピーして編集する
+#
+# このファイルを ~/.tmoe/config.toml にコピーすると tmoe が自動で読み込む。
+# 全項目に内蔵デフォルトがあるので、変えたいセクションだけ書けばよい。
+# 環境変数 (TMOE_LLM_URL / TMOE_LLM_MODEL / TMOE_LLM_BACKEND / TMOE_LLM_DRAFT /
+# TMOE_LLM_API_KEY) でも個別に上書きできる。
 
 [llm]
 # backend: llama_cpp | vllm | lm_studio | rapid_mlx | openai_compat
-backend = "llama_cpp"
-base_url = "http://127.0.0.1:8080/v1"
+# 既定 (= 何も書かないとき) は rapid_mlx (Apple Silicon 向け headless LLM)。
+backend = "rapid_mlx"
+base_url = "http://127.0.0.1:8081/v1"
 api_key = ""
 
-# main_model: 主推論モデル
-main_model = "qwen2.5-coder-32b-instruct"
+# main_model: 主推論モデル。Rapid-MLX の `rapid-mlx models` で出るエイリアス、
+# llama.cpp の場合は -m で渡しているモデル ID を入れる。
+main_model = "qwen3-coder-30b"
 
-# draft_model: 投機的推論用ドラフトモデル
-# バックエンドが投機推論未対応 (例: rapid_mlx 現行版) の場合は無視される
-draft_model = "qwen2.5-coder-0.5b-instruct"
+# draft_model: 投機的推論用ドラフトモデル。
+# rapid_mlx は 2026-05 時点で投機推論未対応のため、ここを空にしておくか、
+# llama_cpp / vllm / lm_studio バックエンドのときだけ埋める。
+draft_model = ""
 spec_n_max = 16
 
 [trio]
-# 合意プロトコルの前進閾値
-confidence_sum_min = 2.4    # 3 頂点の confidence 和の下限
-triangle_balance_min = 0.6  # min/max。1.0 が正三角形、0 で縮退
-max_iter_per_step = 8       # 1 ステップで諦めてエスカレーションするまでの試行回数
+# 合意プロトコルの前進閾値。実機 LLM は中立 confidence 0.7 を返しがちなので
+# CLI 既定は控えめ。Mock 主体で厳密に走らせるなら 2.4 / 0.6 / 8 がオリジナル設計値。
+confidence_sum_min = 1.5    # 3 頂点の confidence 和の下限
+triangle_balance_min = 0.3  # min/max。1.0 が正三角形、0 で縮退
+max_iter_per_step = 4       # 1 ステップで諦めてエスカレーションするまでの内部試行回数
 
 [history]
-# 階層履歴の物理保存場所
-db_path = "~/.tmoe/db.sqlite"
-features_dir = "~/.tmoe/features"
-
-# 逐次コンパクションの巻き上げ閾値 (ノードあたり概算トークン)
-rollup_threshold_tokens = 2000
-
-[tui]
-# ホットキー
-hotkey_pause = "Ctrl-P"
-hotkey_kill = "Ctrl-K"
-hotkey_tree = "Ctrl-T"
+# 階層履歴の保存ルート。配下に `db.sqlite` と `features/<id>/...` ができる。
+# 既定は `~/.tmoe`。`~/` は HOME に展開される。
+root = "~/.tmoe"

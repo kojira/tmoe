@@ -113,6 +113,46 @@ pub async fn run_feature(
         tracing::warn!("{line}");
     };
 
+    // --- 0) Preflight: LLM が立っているかを最初に確認する。
+    //         初見ユーザーが reqwest スタックトレースに直面しないようにするための gate。
+    //         失敗時は History/Worktree を作る前に exit するので、後始末も不要。
+    let preflight_client = OpenAiCompatClient::new(cfg.llm.clone())
+        .context("build OpenAI-compat LLM client (preflight)")?;
+    match preflight_client.health_check().await {
+        Ok(hs) if hs.ok => {
+            status(format!(
+                "LLM ok: {} ({}status={})",
+                hs.url,
+                if hs.main_model_visible {
+                    "model visible, "
+                } else {
+                    ""
+                },
+                hs.status_code
+            ));
+        }
+        Ok(hs) => {
+            let msg = format!(
+                "LLM at {} responded with HTTP {}. Is the right server running?",
+                hs.url, hs.status_code
+            );
+            warn(msg.clone());
+            warn(friendly_llm_setup_hint(&cfg));
+            done(&event_tx, false, msg);
+            return Ok(());
+        }
+        Err(e) => {
+            let msg = format!(
+                "Cannot reach LLM at {}: {}",
+                cfg.llm.base_url, e
+            );
+            warn(msg.clone());
+            warn(friendly_llm_setup_hint(&cfg));
+            done(&event_tx, false, msg);
+            return Ok(());
+        }
+    }
+
     // --- 1) History
     std::fs::create_dir_all(&cfg.history_root)
         .with_context(|| format!("create history root: {}", cfg.history_root.display()))?;
@@ -430,6 +470,100 @@ fn short(s: &str, n: usize) -> String {
 
 fn is_git_repo(p: &Path) -> bool {
     git2::Repository::discover(p).is_ok()
+}
+
+/// LLM が落ちている / 設定が空のときに出す、初見ユーザー向けの 1 文セットアップヒント。
+/// `cfg` を読んで現在指している URL/モデルを言いつつ、起動コマンド例を Apple Silicon /
+/// Linux で 1 つずつ示す。
+pub fn friendly_llm_setup_hint(cfg: &Config) -> String {
+    format!(
+        "Hint: tmoe expects an OpenAI-compatible LLM at {url} (model={model}).\n\
+         - Apple Silicon: rapid-mlx serve qwen3-coder-30b --port 8081\n\
+         - Linux/CUDA:    llama-server -m <model.gguf> --port 8081 --host 127.0.0.1\n\
+         - Or override:   TMOE_LLM_URL=http://your-host:port/v1 TMOE_LLM_MODEL=<id> tmoe \"<task>\"\n\
+         Run `tmoe doctor` to print a one-shot diagnostic.",
+        url = cfg.llm.base_url,
+        model = cfg.llm.main_model,
+    )
+}
+
+/// `tmoe doctor`: 設定 + LLM 接続性 + オプショナルバイナリの 1 ショット診断。
+/// 標準出力に印字する形で、初見ユーザーが「自分の環境がどこまで整っているか」を確認する。
+pub async fn doctor(cfg: &Config) -> Result<bool> {
+    println!("--- tmoe doctor ---");
+    println!("history_root: {}", cfg.history_root.display());
+    let client = OpenAiCompatClient::new(cfg.llm.clone())
+        .context("build OpenAI-compat LLM client")?;
+    let desc = client.describe();
+    println!("backend:      {}", desc.backend);
+    println!("base_url:     {}", desc.base_url);
+    println!("main_model:   {}", desc.main_model);
+    println!(
+        "draft_model:  {} (speculative_enabled={})",
+        desc.draft_model.as_deref().unwrap_or("<none>"),
+        desc.speculative_enabled
+    );
+
+    let mut all_green = true;
+    print!("LLM /v1/models: ");
+    match client.health_check().await {
+        Ok(hs) if hs.ok => {
+            println!(
+                "OK (status={}, main_model_visible={})",
+                hs.status_code, hs.main_model_visible
+            );
+            if !hs.main_model_visible {
+                println!("  note: main_model '{}' is not listed by the backend; it may still work via fallback model loading", desc.main_model);
+            }
+        }
+        Ok(hs) => {
+            println!("FAIL (HTTP {})", hs.status_code);
+            all_green = false;
+        }
+        Err(e) => {
+            println!("FAIL ({e})");
+            all_green = false;
+        }
+    }
+
+    let gh_ok = which_gh();
+    println!("gh CLI:       {}", if gh_ok { "found" } else { "missing (--pr will warn and skip)" });
+    let obscura_path = std::env::var("TMOE_OBSCURA_BIN")
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("which")
+                .arg("obscura")
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+        });
+    println!(
+        "obscura:      {}",
+        obscura_path.as_deref().unwrap_or("missing (web_search/web_fetch will fail at call time)")
+    );
+
+    if !all_green {
+        println!();
+        println!("{}", friendly_llm_setup_hint(cfg));
+    } else {
+        println!();
+        println!("All required components reachable. Try: tmoe \"<task>\"");
+    }
+    Ok(all_green)
+}
+
+fn which_gh() -> bool {
+    std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// プロンプトが Worker に告知している全ツールを 1 箇所で登録する。

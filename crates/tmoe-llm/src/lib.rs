@@ -13,7 +13,7 @@ pub mod types;
 pub use client::LlmClient;
 pub use error::{LlmError, Result};
 pub use mock::{MockLlmClient, ScriptedTurn};
-pub use openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
+pub use openai_compat::{ClientDescription, HealthStatus, OpenAiCompatClient, OpenAiCompatConfig};
 pub use types::{
     Backend, BackendCapabilities, ChatDelta, ChatMessage, ChatRequest, ChatResponse, Role, Usage,
 };

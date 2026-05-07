@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tmoe_cli::app::App;
 use tmoe_cli::concierge::{key_to_thrust, translate};
 use tmoe_cli::config;
-use tmoe_cli::runtime::{run_feature, RunOptions, RuntimeEvent};
+use tmoe_cli::runtime::{doctor, run_feature, RunOptions, RuntimeEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -34,6 +34,7 @@ struct Args {
     workdir: Option<PathBuf>,
     max_rounds: Option<u32>,
     task: Option<String>,
+    subcommand_doctor: bool,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args> {
@@ -79,6 +80,11 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     if positional.first().map(|s| s.as_str()) == Some("ask") {
         positional.remove(0);
     }
+    // `tmoe doctor` は専用 subcommand。task としては扱わない。
+    if positional.first().map(|s| s.as_str()) == Some("doctor") {
+        a.subcommand_doctor = true;
+        positional.remove(0);
+    }
     if !positional.is_empty() {
         a.task = Some(positional.join(" "));
     }
@@ -114,6 +120,11 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+    if args.subcommand_doctor {
+        let ok = doctor(&cfg).await?;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     let flags = RunFlags {
         use_worktree: !args.no_worktree,
         cleanup_worktree: args.cleanup_worktree,
@@ -135,6 +146,8 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("    tmoe [options] \"<task description>\"");
+    println!("    tmoe ask \"<task>\"  — same as above (DESIGN-doc form)");
+    println!("    tmoe doctor         — diagnose config + LLM reachability + optional bins");
     println!("    tmoe                — start the TUI without a task");
     println!("    tmoe --version      — print version");
     println!();

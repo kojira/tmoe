@@ -6,6 +6,51 @@
 
 ---
 
+## クイックスタート (5 分で動かす)
+
+**前提**: macOS (Apple Silicon) または Linux + Rust 1.85+。LLM サーバーは tmoe には同梱しない。
+
+```bash
+# 1) clone & build
+git clone https://github.com/kojira/tmoe.git
+cd tmoe
+cargo build --release
+
+# 2) ローカル LLM を立てる (Apple Silicon の例)
+brew install --cask rapid-mlx        # 初回のみ
+rapid-mlx serve qwen3-coder-30b --port 8081 &
+
+# 3) 環境を診断 (この 1 コマンドで設定/接続/オプショナル bin が表示される)
+./target/release/tmoe doctor
+
+# 4) 動かす — 既定値は Rapid-MLX 8081 + qwen3-coder-30b
+./target/release/tmoe --headless --no-worktree --workdir /tmp/sandbox \
+    "create hello.rs with a fn main printing hello"
+```
+
+**Linux / CUDA で llama.cpp を使う場合:**
+
+```bash
+llama-server -m qwen2.5-coder-32b-instruct.gguf --port 8081 --host 127.0.0.1
+TMOE_LLM_BACKEND=llama_cpp TMOE_LLM_MODEL=qwen2.5-coder-32b-instruct \
+    ./target/release/tmoe doctor
+```
+
+**設定の永続化** (任意):
+```bash
+mkdir -p ~/.tmoe
+cp config/tmoe.toml.example ~/.tmoe/config.toml
+$EDITOR ~/.tmoe/config.toml
+```
+`~/.tmoe/config.toml` があれば自動で読み込まれる。無ければ環境変数 (`TMOE_LLM_*`) と
+内蔵デフォルト (Rapid-MLX 8081 + qwen3-coder-30b) にフォールバックする。
+
+**LLM が立っていないと?** `tmoe` は最初に `GET /v1/models` で preflight して、
+失敗時はエラースタックトレースではなく**起動コマンド例つきのヒント**を出して終了する
+(History DB や worktree も作らずに帰る)。`tmoe doctor` でも同じ診断が見られる。
+
+---
+
 ## なぜ「3 + 1」なのか
 
 tmoe は 3 つのエージェント (Worker / Supervisor / Observer) と 1 人のユーザーで
@@ -161,46 +206,49 @@ Worker からの呼び出し例:
 {"tool":"web_fetch","args":{"url":"https://docs.vllm.ai/en/latest/features/spec_decode.html"}}
 ```
 
-## インストール
+## 詳しい設定
 
-```bash
-git clone https://github.com/kojira/tmoe.git
-cd tmoe
-cargo build --release
-```
+設定は以下の優先順位で解決される:
 
-## 設定
+1. `--config <path>` で渡された TOML
+2. `~/.tmoe/config.toml`
+3. 環境変数 `TMOE_LLM_URL` / `TMOE_LLM_MODEL` / `TMOE_LLM_BACKEND` / `TMOE_LLM_DRAFT` / `TMOE_LLM_API_KEY`
+4. 内蔵デフォルト: Rapid-MLX バックエンド、`http://127.0.0.1:8081/v1`、`qwen3-coder-30b`
 
-```bash
-cp config/tmoe.toml.example config/tmoe.toml
-$EDITOR config/tmoe.toml
-```
-
-最小限の編集ポイント:
+`config/tmoe.toml.example` の `[llm]` 全部:
 
 ```toml
 [llm]
-backend = "llama_cpp"
-base_url = "http://127.0.0.1:8080/v1"
-main_model = "qwen2.5-coder-32b-instruct"
-draft_model = "qwen2.5-coder-0.5b-instruct"
+# backend: llama_cpp | vllm | lm_studio | rapid_mlx | openai_compat
+backend     = "rapid_mlx"
+base_url    = "http://127.0.0.1:8081/v1"
+main_model  = "qwen3-coder-30b"
+draft_model = ""             # rapid_mlx は投機推論未対応 → 空でよい (llama_cpp なら指定可)
+spec_n_max  = 16
 ```
 
-LLM サーバー (llama-server / vLLM / LM Studio / Rapid-MLX 等) の起動は
-tmoe には同梱しない。各自で別途起動しておくこと。
+LLM サーバー (llama-server / vLLM / LM Studio / Rapid-MLX) の起動は tmoe には同梱しない。
+各自で別途起動しておくこと。`tmoe doctor` で `GET /v1/models` の到達性を 1 ショット確認できる。
 
-例 (llama.cpp):
+`llama.cpp` 例:
 
 ```bash
 llama-server \
   -m qwen2.5-coder-32b-instruct.gguf \
   -md qwen2.5-coder-0.5b-instruct.gguf \
-  --port 8080
+  --port 8081
 ```
 
 ## 起動
 
 ```bash
+# CLI (headless モード) - 一発で feature を完走させる
+./target/release/tmoe --headless "<task>"
+
+# TUI モード (デフォルト) - 動作中も Concierge から介入できる
+./target/release/tmoe "<task>"
+
+# 引数なしで起動して TUI 内で task を打ち込むこともできる
 ./target/release/tmoe
 ```
 
