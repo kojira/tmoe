@@ -254,18 +254,32 @@ TMOE_E2E_LLM_BACKEND=llama_cpp \
 `TMOE_E2E_LLM_*` を設定しないと実 LLM テストは skip される。
 バックエンドは `llama_cpp | vllm | lm_studio | rapid_mlx | openai_compat` を選択可能。
 
-## ロードマップ
+## ロードマップと現状
 
-| Phase | 内容 |
-|-------|------|
-| 0 | workspace 足場 + DESIGN.md + README ✅ |
-| 1 | tmoe-llm: LlmClient trait + 能力検出 |
-| 2 | tmoe-history: raw + 3 並走 index + 逐次コンパクション |
-| 3 | tmoe-core::Agent 単体 + ツール呼び出し |
-| 4 | Trio オーケストレータ + 合意ループ + park 状態 |
-| 5 | tmoe-tree + tmoe-rag |
-| 6 | TUI と Concierge 常駐 |
-| 7 | Worktree 自動化と自己レビュー |
+各 Phase の状態は **ライブラリ完了** と **end-to-end 実機 LLM 経由で検証済み** を区別する。
+✅ = 実 LLM (Rapid-MLX qwen3-coder-30b) を介した e2e テストで挙動が確認済み。
+
+| Phase | 内容 | 状態 | 検証 e2e |
+|-------|------|------|----------|
+| 0 | workspace 足場 + DESIGN.md + README | ✅ | `cargo check` |
+| 1 | tmoe-llm: LlmClient trait + 能力検出 | ✅ | `e2e_real_backend` |
+| 2 | tmoe-history: raw + 3 並走 index + 逐次コンパクション | ✅ | `e2e_real_refactor_compacted` (3 view 別パーソナリティ) |
+| 3 | tmoe-core::Agent 単体 + ツール呼び出し | ✅ | `e2e_real_program` (3 シナリオ) |
+| 4 | Trio オーケストレータ + 合意ループ + park 状態 | ✅ | `e2e_real_trio` / `e2e_real_trio_views` (Worker view → Supervisor / Observer に注入) |
+| 5 | tmoe-tree + tmoe-rag | ✅ | `e2e_real_trio_search_source` (Worker が `search_source` を実呼出し) |
+| 6 | TUI と Concierge 常駐 (動的タスク投入対応) | ✅ | `e2e_real_cli` (バイナリ headless 完走) + ユニット (TUI dynamic spawn) |
+| 7 | Worktree 自動化 + 任意 PR ドラフト | ✅ | `runtime` ユニット (`gh pr create` argv をスタブで検証) + `e2e_real_cli` (worktree carve + commit + cleanup) |
+
+**実 LLM 経由で確認済みの結線層 (= 「ライブラリは動くが繋がっていない」状態の解消):**
+`tmoe "<task>"` 1 コマンドで「feature 作成 → worktree 切り出し → Trio (Worker/Supervisor/Observer) +
+Z 軸推進 → ツール実行 (read/edit/patch/list/grep/run_cmd/search_source/web_*) → ViewProvider 経由で
+3 view brief を投票に渡す → raw + 3 view 並走逐次コンパクション → git commit → 任意で `gh pr create --draft`」
+までが 1 セッションで通る。Concierge からの redirect は USER REDIRECT として Worker に再投入され、
+park 状態は ThrustChannel 経由で次の Z 軸推進を待つ。`--max-rounds N` でセッション境界を制御。
+
+**残る (今日時点の) 設計上のスコープ:**
+- 実 LLM が `web_fetch` を呼ぶ経路は obscura スタブ越しに e2e 確認済み。**実 obscura バイナリ越しは未検証** (`TMOE_E2E_OBSCURA_BIN` 設定時の単体 e2e のみ)。
+- `gh pr create --draft` は argv 構築をスタブで検証済み。**実 GitHub リモートでの PR 開設は未検証**。
 
 詳細は [`docs/DESIGN.md` §11](docs/DESIGN.md#11-ロードマップ-フェーズ分割) 参照。
 

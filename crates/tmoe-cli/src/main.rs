@@ -3,15 +3,11 @@
 //! 入力中も裏で Trio が動き続ける (常駐 = 非ブロッキング)。
 //! Concierge は 4 人目のエージェントではなく、ユーザー Z 軸推進力を平面に伝達する I/O チャネル。
 
-mod app;
-mod concierge;
-mod config;
-mod runtime;
-mod source_tool;
-
 use anyhow::{Context, Result};
-use app::App;
-use concierge::{key_to_thrust, translate};
+use tmoe_cli::app::App;
+use tmoe_cli::concierge::{key_to_thrust, translate};
+use tmoe_cli::config;
+use tmoe_cli::runtime::{run_feature, RunOptions, RuntimeEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -20,7 +16,6 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::Widget;
 use ratatui::Terminal;
-use runtime::{run_feature, RunOptions, RuntimeEvent};
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;

@@ -543,11 +543,9 @@ mod tests {
         opts.gh_bin = Some(stub_path.clone());
         opts.open_pr = true;
 
-        let mut said: Vec<String> = Vec::new();
-        let mut warned: Vec<String> = Vec::new();
-        // closures capture by &mut but our run_gh_pr_create takes &F1: Fn(String). RefCell ではなく
-        // `&dyn Fn(String)` 経由で集めたいが、Fn(String) ならクロージャは外側の Vec を `&mut`
-        // でキャプチャできない (Fn は &self)。代わりに RefCell でラップする。
+        // closures capture by &mut but our run_gh_pr_create takes &F1: Fn(String).
+        // クロージャは外側の Vec を `&mut` でキャプチャできない (Fn は &self)。
+        // 代わりに RefCell でラップする。
         let said_cell = std::cell::RefCell::new(Vec::<String>::new());
         let warned_cell = std::cell::RefCell::new(Vec::<String>::new());
         let say = |s: String| said_cell.borrow_mut().push(s);

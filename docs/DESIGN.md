@@ -412,16 +412,18 @@ tmoe/
 
 各フェーズは独立して動作確認可能。
 
-| Phase | 内容 | 終了条件 |
-|-------|------|----------|
-| **0** | workspace 足場 + DESIGN.md + README.md | `cargo check` 緑 |
-| **1** | tmoe-llm: LlmClient trait + OpenAiCompatClient + 能力検出 | llama-server に対し chat/stream/draft_model 送出が確認できる |
-| **2** | tmoe-history: raw + 3 並走 index、逐次コンパクション API | 1 feature を書き込み、再読込で 3 view が異なる粒度で復元される |
-| **3** | tmoe-core::Agent 単体 + ツール呼び出し | "hello.rs を作って" を 1 エージェントで完遂 |
-| **4** | Trio オーケストレータ + 合意ループ + park 状態 | `trio_consensus_loop_terminates` と `park_until_user_thrust` がパス |
-| **5** | tmoe-tree + tmoe-rag | 自リポジトリで木構築、`search("ConciergeAgent")` が当該ノードに到達 |
-| **6** | TUI と Concierge 常駐 | Trio 動作中に Concierge へメッセージ投入できる |
-| **7** | Worktree 自動化と自己レビュー | `tmoe ask "..."` で worktree 切り出し→コミット→PR ドラフト |
+✅ = 実 LLM (Rapid-MLX qwen3-coder-30b) 越しの e2e テストで終了条件を満たすことを確認済み。
+
+| Phase | 内容 | 終了条件 | 状態 |
+|-------|------|----------|------|
+| **0** | workspace 足場 + DESIGN.md + README.md | `cargo check` 緑 | ✅ |
+| **1** | tmoe-llm: LlmClient trait + OpenAiCompatClient + 能力検出 | llama-server に対し chat/stream/draft_model 送出が確認できる | ✅ (`e2e_real_backend`) |
+| **2** | tmoe-history: raw + 3 並走 index、逐次コンパクション API | 1 feature を書き込み、再読込で 3 view が異なる粒度で復元される | ✅ (`e2e_real_refactor_compacted`) |
+| **3** | tmoe-core::Agent 単体 + ツール呼び出し | "hello.rs を作って" を 1 エージェントで完遂 | ✅ (`e2e_real_program`) |
+| **4** | Trio オーケストレータ + 合意ループ + park 状態 | `trio_consensus_loop_terminates` と `park_until_user_thrust` がパス | ✅ (`e2e_real_trio` + `e2e_real_trio_views` で ViewProvider 経由の view 注入も確認) |
+| **5** | tmoe-tree + tmoe-rag | 自リポジトリで木構築、`search("ConciergeAgent")` が当該ノードに到達 | ✅ Worker が実 LLM 越しに `search_source` を ToolCall として実呼出し (`e2e_real_trio_search_source`) |
+| **6** | TUI と Concierge 常駐 | Trio 動作中に Concierge へメッセージ投入でき、redirect が USER REDIRECT として Worker に再投入される | ✅ TUI 動的タスク投入実装 + `e2e_real_cli` で `tmoe` バイナリが headless 完走 |
+| **7** | Worktree 自動化と自己レビュー | `tmoe ask "..."` で worktree 切り出し→コミット→任意で PR ドラフト | ✅ worktree carve → commit → cleanup → `gh pr create --draft` (argv はスタブで検証)。**実 GitHub リモートでの PR 開設は未検証** |
 
 ---
 
