@@ -16,23 +16,53 @@ pub enum ConciergeIntent {
     Redirect,
 }
 
+/// 入力テキストから ConciergeIntent を分類する。
+///
+/// 旧実装は `starts_with` を使っていたため "stop using mocks" を Stop と誤分類していた。
+/// 新実装は **first-token equality** に切り替える: 制御語は単独 (または短い丁寧語の連結) の
+/// ときだけ制御扱い。3 トークン以上ある自然文はすべて Redirect として Worker にメッセージとして
+/// 投入する。
 pub fn classify_intent(input: &str) -> ConciergeIntent {
     let s = input.trim().to_lowercase();
     if s.is_empty() {
         return ConciergeIntent::Pause;
     }
-    let stop_keys = ["stop", "中断", "やめて", "中止", "abort"];
-    if stop_keys.iter().any(|k| s == *k || s.starts_with(k)) {
-        return ConciergeIntent::Stop;
+
+    // ASCII 空白と全角空白の両方で分割。日本語句点・カンマ末尾は剥がす。
+    let stripped: String = s
+        .trim_end_matches(|c: char| matches!(c, '.' | '、' | ',' | '。' | '!' | '！' | '?' | '？'))
+        .to_string();
+    let tokens: Vec<&str> = stripped
+        .split(|c: char| c.is_whitespace() || c == '\u{3000}')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let first = match tokens.first() {
+        Some(t) => *t,
+        None => return ConciergeIntent::Pause,
+    };
+
+    // 制御語。第 1 トークンが完全一致すれば intent 確定。
+    let stop_keys = ["stop", "中断", "やめて", "中止", "abort", "やめる", "中断して"];
+    let pause_keys = ["pause", "wait", "停止", "ちょっと", "待って", "待機"];
+    let go_keys = [
+        "go", "ok", "okay", "yes", "y", "approve", "ack", "ack.",
+        "進めて", "進め", "続けて", "了解", "ok.", "yes.",
+    ];
+
+    let is_short = tokens.len() <= 2; // "stop please" / "go now" 程度は許容、それ以上は Redirect。
+
+    if is_short {
+        if stop_keys.iter().any(|k| *k == first) {
+            return ConciergeIntent::Stop;
+        }
+        if pause_keys.iter().any(|k| *k == first) {
+            return ConciergeIntent::Pause;
+        }
+        if go_keys.iter().any(|k| *k == first) {
+            return ConciergeIntent::Go;
+        }
     }
-    let pause_keys = ["pause", "待って", "wait", "停止", "ちょっと"];
-    if pause_keys.iter().any(|k| s == *k || s.starts_with(k)) {
-        return ConciergeIntent::Pause;
-    }
-    let go_keys = ["go", "進めて", "ok", "yes", "y", "進め", "続けて", "approve", "ack"];
-    if go_keys.iter().any(|k| s == *k) {
-        return ConciergeIntent::Go;
-    }
+    // それ以外 (=自然文) はすべて Redirect として Worker に渡す。
     ConciergeIntent::Redirect
 }
 
@@ -85,7 +115,7 @@ mod tests {
 
     #[test]
     fn stop_keywords() {
-        for k in ["stop", "中断して", "やめて", "abort now"] {
+        for k in ["stop", "中断して", "やめて", "abort"] {
             assert_eq!(classify_intent(k), ConciergeIntent::Stop, "{k}");
         }
     }
@@ -95,6 +125,33 @@ mod tests {
         for k in ["pause", "待って", "ちょっと"] {
             assert_eq!(classify_intent(k), ConciergeIntent::Pause, "{k}");
         }
+    }
+
+    /// 自然文に制御語が **含まれる** ケース: redirect として Worker に渡るべき。
+    /// 旧実装の `starts_with` で誤分類されていたケースを回帰防止する。
+    #[test]
+    fn natural_sentence_with_control_word_prefix_is_redirect() {
+        for s in [
+            "stop using mocks, switch to real LLM",
+            "stop calling the wrong file",
+            "wait until tests pass before merging",
+            "pause the cargo build and try a smaller crate first",
+            "go to src/util.rs and rename gcd to euclid_gcd",
+            "abort the current PR draft and re-create it from scratch",
+        ] {
+            assert!(
+                matches!(classify_intent(s), ConciergeIntent::Redirect),
+                "should be Redirect: {s}"
+            );
+        }
+    }
+
+    /// 短い丁寧語接尾は許容: "stop please" / "go now" / "ok."
+    #[test]
+    fn short_polite_forms_are_still_control_intent() {
+        assert_eq!(classify_intent("stop please"), ConciergeIntent::Stop);
+        assert_eq!(classify_intent("go now"), ConciergeIntent::Go);
+        assert_eq!(classify_intent("ok."), ConciergeIntent::Go);
     }
 
     #[test]

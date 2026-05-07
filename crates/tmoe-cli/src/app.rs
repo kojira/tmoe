@@ -15,6 +15,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Widget};
 
+/// TUI ペインに保持するログの最大行数。これを超えると古い行が破棄される (= スクロールバック上限)。
+/// 1 行 ≈ 200 文字想定で、`500 * 4 = 2000` ペイン × 200B ≈ 400KB 程度に収まる。
+pub const LOG_CAP: usize = 500;
+
 #[derive(Debug, Default, Clone)]
 pub struct App {
     pub concierge: Vec<String>,
@@ -23,27 +27,45 @@ pub struct App {
     pub features: Vec<String>,
     pub input_buffer: String,
     pub status: String,
+    /// 各ログの上限。テスト用に上書き可能。
+    pub log_cap: usize,
 }
 
 impl App {
     pub fn new() -> Self {
         Self {
             status: "tmoe ready — 3 + 1 mode".into(),
+            log_cap: LOG_CAP,
             ..Default::default()
         }
     }
 
+    fn push_bounded(buf: &mut Vec<String>, cap: usize, line: String) {
+        buf.push(line);
+        // バウンド超過時は **先頭を切る** (= 古いログから捨てる)。drain は O(N) になるが
+        // pop は最新を捨ててしまうので逆。VecDeque の方が pop_front が O(1) だが、
+        // ratatui の List は &[ListItem] なので連続スライスが必要。少数行ずつ落とす実装で十分。
+        if buf.len() > cap {
+            let excess = buf.len() - cap;
+            buf.drain(0..excess);
+        }
+    }
+
     pub fn on_concierge(&mut self, line: String) {
-        self.concierge.push(line);
+        Self::push_bounded(&mut self.concierge, self.log_cap, line);
     }
     pub fn on_trio(&mut self, line: String) {
-        self.trio_log.push(line);
+        Self::push_bounded(&mut self.trio_log, self.log_cap, line);
     }
     pub fn on_warning(&mut self, line: String) {
-        self.observer_warnings.push(line);
+        Self::push_bounded(&mut self.observer_warnings, self.log_cap, line);
     }
     pub fn set_features(&mut self, items: Vec<String>) {
         self.features = items;
+        if self.features.len() > self.log_cap {
+            let excess = self.features.len() - self.log_cap;
+            self.features.drain(0..excess);
+        }
     }
     pub fn append_char(&mut self, c: char) {
         self.input_buffer.push(c);
@@ -53,6 +75,15 @@ impl App {
     }
     pub fn take_input(&mut self) -> String {
         std::mem::take(&mut self.input_buffer)
+    }
+
+    /// ペイン高さに合わせて末尾 N 行のスライスを返す。新しい行が下に来る。
+    pub fn tail<'a>(buf: &'a [String], n: usize) -> &'a [String] {
+        if buf.len() <= n {
+            buf
+        } else {
+            &buf[buf.len() - n..]
+        }
     }
 }
 
@@ -79,36 +110,44 @@ impl Widget for &App {
         let trio_pane = right[0];
         let warn_pane = right[1];
 
-        // Concierge ペイン: 履歴 + 入力行。
-        let mut conc_lines: Vec<Line> = self.concierge.iter().map(|s| Line::from(s.as_str())).collect();
+        // 各ペインに収まる末尾 N 行だけ render する (= スクロールバック: 新しい行が見える)。
+        // pane height はボーダーを除いた内寄り高さに依存するので、保守的に
+        // `pane.height - 2` をターゲットにする (タイトル + 下線で 2 行消費)。
+        let pane_h = |area: Rect| area.height.saturating_sub(2) as usize;
+        let conc_n = pane_h(concierge_pane);
+        let trio_n = pane_h(trio_pane);
+        let warn_n = pane_h(warn_pane);
+        let feat_n = pane_h(bottom_tree);
+
+        // Concierge ペイン: 履歴 (末尾 N-2 行) + 入力プロンプト 2 行。
+        let conc_keep = conc_n.saturating_sub(2);
+        let conc_visible = App::tail(&self.concierge, conc_keep);
+        let mut conc_lines: Vec<Line> = conc_visible.iter().map(|s| Line::from(s.as_str())).collect();
         conc_lines.push(Line::from("> "));
         conc_lines.push(Line::from(self.input_buffer.as_str()));
         Paragraph::new(conc_lines)
             .block(Block::default().borders(Borders::ALL).title("Concierge — Z 軸推進入力"))
             .render(concierge_pane, buf);
 
-        // Trio ライブログ。
-        let trio_items: Vec<ListItem> = self
-            .trio_log
-            .iter()
-            .map(|s| ListItem::new(s.as_str()))
-            .collect();
+        // Trio ライブログ (末尾 N 行)。
+        let trio_visible = App::tail(&self.trio_log, trio_n);
+        let trio_items: Vec<ListItem> =
+            trio_visible.iter().map(|s| ListItem::new(s.as_str())).collect();
         List::new(trio_items)
             .block(Block::default().borders(Borders::ALL).title("Trio (Worker/Supervisor/Observer)"))
             .render(trio_pane, buf);
 
-        // Observer 警告。
-        let warn_items: Vec<ListItem> = self
-            .observer_warnings
-            .iter()
-            .map(|s| ListItem::new(s.as_str()))
-            .collect();
+        // Observer 警告 (末尾 N 行)。
+        let warn_visible = App::tail(&self.observer_warnings, warn_n);
+        let warn_items: Vec<ListItem> =
+            warn_visible.iter().map(|s| ListItem::new(s.as_str())).collect();
         List::new(warn_items)
             .block(Block::default().borders(Borders::ALL).title("Observer warnings"))
             .render(warn_pane, buf);
 
-        // 機能ツリー。
-        let f_items: Vec<ListItem> = self.features.iter().map(|s| ListItem::new(s.as_str())).collect();
+        // 機能ツリー (末尾 N 行)。
+        let feat_visible = App::tail(&self.features, feat_n);
+        let f_items: Vec<ListItem> = feat_visible.iter().map(|s| ListItem::new(s.as_str())).collect();
         List::new(f_items)
             .block(Block::default().borders(Borders::ALL).title("Features"))
             .render(bottom_tree, buf);
@@ -148,6 +187,37 @@ mod tests {
         assert!(dump.contains("Observer"));
         assert!(dump.contains("Features"));
         assert!(dump.contains("3 + 1"));
+    }
+
+    #[test]
+    fn log_is_bounded_by_cap_and_keeps_newest() {
+        let mut app = App::new();
+        app.log_cap = 3;
+        for i in 0..10 {
+            app.on_trio(format!("line {i}"));
+        }
+        assert_eq!(app.trio_log.len(), 3);
+        assert_eq!(app.trio_log[0], "line 7");
+        assert_eq!(app.trio_log[2], "line 9");
+    }
+
+    #[test]
+    fn rendered_pane_shows_newest_lines_when_log_overflows_pane_height() {
+        let mut app = App::new();
+        // ペインに収まる以上の行を投入する。`tail` で末尾だけ render される設計の検証。
+        for i in 0..40 {
+            app.on_trio(format!("trio_msg_{i}"));
+        }
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| (&app).render(f.area(), f.buffer_mut())).unwrap();
+        let buffer = term.backend().buffer().clone();
+        let dump: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        // 最新行は必ず表示される。
+        assert!(dump.contains("trio_msg_39"), "newest line missing");
+        // 古すぎる行は窓から外れて見えない (ペイン高さは ~10-15 行なので 0 番台は出ない)。
+        assert!(!dump.contains("trio_msg_0\n") && !dump.contains("trio_msg_5\n"),
+            "old line should not be in the visible pane");
     }
 
     #[test]

@@ -11,6 +11,48 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// 既知のスキーママイグレーション。番号順に適用される。
+/// 新しい列やテーブルを足したいときはこのリストの末尾に `(N+1, "...sql...")` を追加する。
+/// 既存の番号は **絶対に書き換えない** (歴史的不変)。
+const MIGRATIONS: &[(u32, &str)] = &[(
+    1,
+    r#"
+    CREATE TABLE IF NOT EXISTS feature (
+        id           TEXT PRIMARY KEY,
+        title        TEXT NOT NULL,
+        status       TEXT NOT NULL,
+        root_node_id TEXT NOT NULL,
+        created_at   INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS raw_node (
+        id           TEXT PRIMARY KEY,
+        feature_id   TEXT NOT NULL,
+        parent_id    TEXT,
+        kind         TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        FOREIGN KEY(feature_id) REFERENCES feature(id)
+    );
+    CREATE TABLE IF NOT EXISTS agent_summary_node (
+        id           TEXT PRIMARY KEY,
+        feature_id   TEXT NOT NULL,
+        agent        TEXT NOT NULL CHECK(agent IN ('worker','supervisor','observer')),
+        parent_id    TEXT,
+        summary      TEXT NOT NULL,
+        ref_raw_ids  TEXT NOT NULL,
+        ref_hashes   TEXT NOT NULL,
+        level        INTEGER NOT NULL,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL,
+        FOREIGN KEY(feature_id) REFERENCES feature(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_raw_feature_parent
+        ON raw_node(feature_id, parent_id);
+    CREATE INDEX IF NOT EXISTS idx_summary_feature_agent
+        ON agent_summary_node(feature_id, agent, level);
+    "#,
+)];
+
 pub struct HistoryStore {
     conn: Mutex<Connection>,
     base_dir: PathBuf,
@@ -48,44 +90,52 @@ impl HistoryStore {
     }
 
     fn migrate(conn: &Connection) -> Result<()> {
+        // schema_version 表自体は手動で必ず作る (= migration runner の足場)。
         conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS feature (
-                id           TEXT PRIMARY KEY,
-                title        TEXT NOT NULL,
-                status       TEXT NOT NULL,
-                root_node_id TEXT NOT NULL,
-                created_at   INTEGER NOT NULL
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL PRIMARY KEY
             );
-            CREATE TABLE IF NOT EXISTS raw_node (
-                id           TEXT PRIMARY KEY,
-                feature_id   TEXT NOT NULL,
-                parent_id    TEXT,
-                kind         TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                created_at   INTEGER NOT NULL,
-                FOREIGN KEY(feature_id) REFERENCES feature(id)
-            );
-            CREATE TABLE IF NOT EXISTS agent_summary_node (
-                id           TEXT PRIMARY KEY,
-                feature_id   TEXT NOT NULL,
-                agent        TEXT NOT NULL CHECK(agent IN ('worker','supervisor','observer')),
-                parent_id    TEXT,
-                summary      TEXT NOT NULL,
-                ref_raw_ids  TEXT NOT NULL,
-                ref_hashes   TEXT NOT NULL,
-                level        INTEGER NOT NULL,
-                created_at   INTEGER NOT NULL,
-                updated_at   INTEGER NOT NULL,
-                FOREIGN KEY(feature_id) REFERENCES feature(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_raw_feature_parent
-                ON raw_node(feature_id, parent_id);
-            CREATE INDEX IF NOT EXISTS idx_summary_feature_agent
-                ON agent_summary_node(feature_id, agent, level);
             "#,
         )?;
+        let cur: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let target = MIGRATIONS.last().map(|(v, _)| *v as i64).unwrap_or(0);
+        if cur > target {
+            return Err(HistoryError::Invalid(format!(
+                "history DB is at schema version {cur} but this build only knows up to {target}; \
+                 please upgrade tmoe or use a newer DB on a newer install"
+            )));
+        }
+        for (v, sql) in MIGRATIONS.iter() {
+            if (*v as i64) <= cur {
+                continue;
+            }
+            conn.execute_batch(sql)?;
+            conn.execute(
+                "INSERT INTO schema_version(version) VALUES(?1)",
+                params![*v as i64],
+            )?;
+        }
         Ok(())
+    }
+
+    /// テスト/ doctor 用: 現在の schema バージョンを返す。
+    pub fn schema_version(&self) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let v: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(v as u32)
     }
 
     pub fn base_dir(&self) -> &Path {
@@ -402,6 +452,39 @@ impl HistoryStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn schema_version_is_set_after_open() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::open(dir.path()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 1);
+        // 同じ DB を再度 open しても再適用されないこと (idempotent)。
+        drop(store);
+        let store2 = HistoryStore::open(dir.path()).unwrap();
+        assert_eq!(store2.schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn rejects_db_with_higher_schema_version_than_we_know() {
+        // 「未来から来た DB」(schema_version > MIGRATIONS の最大番号) は明示的に拒否する。
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        std::fs::create_dir_all(dir.path().join("features")).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY); \
+             INSERT INTO schema_version(version) VALUES(99);",
+        )
+        .unwrap();
+        drop(conn);
+        let res = HistoryStore::open(dir.path());
+        assert!(res.is_err(), "should reject DB from the future");
+        let msg = res.err().unwrap().to_string();
+        assert!(
+            msg.contains("schema version 99") || msg.contains("schema_version") || msg.contains("up to"),
+            "unexpected error: {msg}"
+        );
+    }
 
     fn fresh_store() -> (tempfile::TempDir, HistoryStore) {
         let dir = tempdir().unwrap();

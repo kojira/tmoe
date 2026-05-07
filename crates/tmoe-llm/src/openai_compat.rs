@@ -25,6 +25,12 @@ pub struct OpenAiCompatConfig {
     pub draft_model: Option<String>,
     pub spec_n_max: Option<u32>,
     pub api_key: Option<String>,
+    /// 1 リクエストあたりの最大待機時間 (秒)。None なら 120 秒。
+    /// LLM のサーバ側ハングや極端に重い prompt に対する safety net。
+    pub request_timeout_secs: Option<u64>,
+    /// 一過性エラー (timeout / 接続切断 / 5xx) のときの再試行回数。0 なら無効。
+    /// 既定は 3 (= 250ms → 500ms → 1s の指数バックオフ)。
+    pub retry_max_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,43 +175,121 @@ fn backend_supports_speculative(backend: Backend) -> bool {
     }
 }
 
+impl OpenAiCompatClient {
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.config.request_timeout_secs.unwrap_or(120))
+    }
+    fn retry_max(&self) -> u32 {
+        self.config.retry_max_attempts.unwrap_or(3)
+    }
+
+    /// 与えられた non-stream POST を **timeout + 指数バックオフ retry** で 1 度に包む。
+    /// 一過性エラーのみ retry: タイムアウト / 接続失敗 / 5xx。4xx と JSON parse エラーは即時失敗。
+    async fn chat_with_retry(&self, req: ChatRequest) -> Result<ChatResponse> {
+        let url = self.chat_url()?;
+        let body = self.build_request_body(&req, false);
+        let mut attempt: u32 = 0;
+        let max = self.retry_max();
+        loop {
+            attempt += 1;
+            let mut builder = self.http.post(url.clone()).json(&body).timeout(self.timeout());
+            if let Some(k) = &self.config.api_key {
+                builder = builder.bearer_auth(k);
+            }
+            let send = builder.send().await;
+            let resp = match send {
+                Ok(r) => r,
+                Err(e) => {
+                    if is_transient_send_error(&e) && attempt <= max {
+                        tracing::warn!("LLM transient send error (attempt {attempt}/{max}): {e}");
+                        backoff(attempt).await;
+                        continue;
+                    }
+                    return Err(LlmError::from(e));
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                if is_transient_status(status.as_u16()) && attempt <= max {
+                    tracing::warn!(
+                        "LLM transient HTTP {} (attempt {attempt}/{max}): {}",
+                        status.as_u16(),
+                        body_text.chars().take(200).collect::<String>()
+                    );
+                    backoff(attempt).await;
+                    continue;
+                }
+                return Err(LlmError::BadStatus { status: status.as_u16(), body: body_text });
+            }
+            let parsed: OpenAiChatResponse = resp.json().await.map_err(LlmError::from)?;
+            return Ok(parsed.into_chat_response());
+        }
+    }
+}
+
+fn is_transient_send_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
+}
+fn is_transient_status(code: u16) -> bool {
+    // 408 Request Timeout / 429 Too Many Requests / 5xx は再試行価値あり。
+    code == 408 || code == 429 || (500..=599).contains(&code)
+}
+async fn backoff(attempt: u32) {
+    // 1: 250ms, 2: 500ms, 3: 1s, 4: 2s ... cap 8s
+    let ms = 250u64.saturating_mul(1u64 << (attempt.saturating_sub(1)));
+    let ms = ms.min(8_000);
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
 #[async_trait]
 impl LlmClient for OpenAiCompatClient {
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
-        let url = self.chat_url()?;
-        let body = self.build_request_body(&req, false);
-        let mut builder = self.http.post(url).json(&body);
-        if let Some(k) = &self.config.api_key {
-            builder = builder.bearer_auth(k);
-        }
-        let resp = builder.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(LlmError::BadStatus { status: status.as_u16(), body });
-        }
-        let parsed: OpenAiChatResponse = resp.json().await.map_err(LlmError::from)?;
-        Ok(parsed.into_chat_response())
+        self.chat_with_retry(req).await
     }
 
     async fn chat_stream(
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<ChatDelta>>> {
+        // Stream は本体到達後の中断は安全に巻き戻せないので、retry は **接続確立まで** に限定する。
         let url = self.chat_url()?;
         let body = self.build_request_body(&req, true);
-        let mut builder = self.http.post(url).json(&body);
-        if let Some(k) = &self.config.api_key {
-            builder = builder.bearer_auth(k);
+        let mut attempt: u32 = 0;
+        let max = self.retry_max();
+        loop {
+            attempt += 1;
+            let mut builder = self.http.post(url.clone()).json(&body).timeout(self.timeout());
+            if let Some(k) = &self.config.api_key {
+                builder = builder.bearer_auth(k);
+            }
+            let resp = match builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if is_transient_send_error(&e) && attempt <= max {
+                        tracing::warn!("LLM stream transient send error (attempt {attempt}/{max}): {e}");
+                        backoff(attempt).await;
+                        continue;
+                    }
+                    return Err(LlmError::from(e));
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                if is_transient_status(status.as_u16()) && attempt <= max {
+                    tracing::warn!(
+                        "LLM stream transient HTTP {} (attempt {attempt}/{max})",
+                        status.as_u16()
+                    );
+                    backoff(attempt).await;
+                    continue;
+                }
+                return Err(LlmError::BadStatus { status: status.as_u16(), body: body_text });
+            }
+            let bytes_stream = resp.bytes_stream().map(|r| r.map_err(LlmError::from));
+            return Ok(SseDeltaStream::new(bytes_stream).boxed());
         }
-        let resp = builder.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(LlmError::BadStatus { status: status.as_u16(), body });
-        }
-        let bytes_stream = resp.bytes_stream().map(|r| r.map_err(LlmError::from));
-        Ok(SseDeltaStream::new(bytes_stream).boxed())
     }
 
     fn capabilities(&self) -> &BackendCapabilities {
@@ -417,6 +501,8 @@ mod tests {
             draft_model: draft.map(|s| s.to_string()),
             spec_n_max: Some(16),
             api_key: None,
+            request_timeout_secs: None,
+            retry_max_attempts: None,
         }
     }
 

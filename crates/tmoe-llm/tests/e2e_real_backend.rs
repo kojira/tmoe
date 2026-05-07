@@ -38,6 +38,8 @@ fn config_from_env() -> Option<OpenAiCompatConfig> {
         draft_model,
         spec_n_max: Some(16),
         api_key: env::var("TMOE_E2E_LLM_API_KEY").ok(),
+            request_timeout_secs: None,
+            retry_max_attempts: None,
     })
 }
 

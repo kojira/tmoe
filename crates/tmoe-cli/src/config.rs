@@ -33,6 +33,8 @@ pub struct RawLlm {
     pub main_model: Option<String>,
     pub draft_model: Option<String>,
     pub spec_n_max: Option<u32>,
+    pub request_timeout_secs: Option<u64>,
+    pub retry_max_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -128,6 +130,8 @@ impl Config {
                 .or_else(|| std::env::var("TMOE_LLM_DRAFT").ok().filter(|s| !s.is_empty())),
             spec_n_max: raw.llm.spec_n_max.or(Some(16)),
             api_key,
+            request_timeout_secs: raw.llm.request_timeout_secs,
+            retry_max_attempts: raw.llm.retry_max_attempts,
         };
         let trio = TrioCfg {
             confidence_sum_min: raw.trio.confidence_sum_min.unwrap_or(1.5),
