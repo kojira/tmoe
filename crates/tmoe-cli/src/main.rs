@@ -33,9 +33,11 @@ struct Args {
     show_help: bool,
     headless: bool,
     no_worktree: bool,
+    cleanup_worktree: bool,
     open_pr: bool,
     config_path: Option<PathBuf>,
     workdir: Option<PathBuf>,
+    max_rounds: Option<u32>,
     task: Option<String>,
 }
 
@@ -50,7 +52,13 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             "--help" | "-h" => a.show_help = true,
             "--headless" => a.headless = true,
             "--no-worktree" => a.no_worktree = true,
+            "--cleanup-worktree" => a.cleanup_worktree = true,
             "--pr" => a.open_pr = true,
+            "--max-rounds" => {
+                i += 1;
+                let s = argv.get(i).context("--max-rounds needs a number")?;
+                a.max_rounds = Some(s.parse().context("--max-rounds must be u32")?);
+            }
             "--config" => {
                 i += 1;
                 a.config_path = Some(PathBuf::from(
@@ -111,31 +119,19 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+    let flags = RunFlags {
+        use_worktree: !args.no_worktree,
+        cleanup_worktree: args.cleanup_worktree,
+        open_pr: args.open_pr,
+        max_rounds: args.max_rounds.unwrap_or(4),
+    };
     match args.task.clone() {
-        Some(task) if args.headless => {
-            run_headless(task, cfg, workdir, !args.no_worktree, args.open_pr).await
-        }
-        Some(task) => run_tui(
-            Some(task),
-            cfg,
-            workdir,
-            RunFlags {
-                use_worktree: !args.no_worktree,
-                open_pr: args.open_pr,
-            },
-        ),
+        Some(task) if args.headless => run_headless(task, cfg, workdir, flags).await,
+        Some(task) => run_tui(Some(task), cfg, workdir, flags),
         None if args.headless => {
             anyhow::bail!("--headless requires a task argument: tmoe --headless \"<task>\"")
         }
-        None => run_tui(
-            None,
-            cfg,
-            workdir,
-            RunFlags {
-                use_worktree: !args.no_worktree,
-                open_pr: args.open_pr,
-            },
-        ),
+        None => run_tui(None, cfg, workdir, flags),
     }
 }
 
@@ -150,7 +146,9 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    --headless          run to completion without TUI (auto Go)");
     println!("    --no-worktree       do not carve a feature worktree (work in cwd)");
+    println!("    --cleanup-worktree  prune the feature worktree after success");
     println!("    --pr                after commit, open a draft PR via gh");
+    println!("    --max-rounds N      max Trio rounds per session (default 4); redirect/park count as 1");
     println!("    --config <path>     use this TOML config (else ~/.tmoe/config.toml)");
     println!("    --workdir <path>    treat this dir as the workspace root (else cwd)");
     println!();
@@ -166,8 +164,7 @@ async fn run_headless(
     task: String,
     cfg: config::Config,
     workdir: PathBuf,
-    use_worktree: bool,
-    open_pr: bool,
+    flags: RunFlags,
 ) -> Result<()> {
     let (thrust_tx, thrust_rx) = ThrustChannel::new();
     thrust_tx
@@ -178,18 +175,12 @@ async fn run_headless(
     let (event_tx, mut event_rx) = mpsc::channel::<RuntimeEvent>(64);
 
     let runner = tokio::spawn(async move {
-        run_feature(
-            cfg,
-            RunOptions {
-                task,
-                workdir,
-                use_worktree,
-                open_pr,
-            },
-            thrust_rx,
-            Some(event_tx),
-        )
-        .await
+        let mut opts = RunOptions::new(task, workdir);
+        opts.use_worktree = flags.use_worktree;
+        opts.cleanup_worktree = flags.cleanup_worktree;
+        opts.open_pr = flags.open_pr;
+        opts.max_rounds = flags.max_rounds;
+        run_feature(cfg, opts, thrust_rx, Some(event_tx)).await
     });
 
     while let Some(ev) = event_rx.recv().await {
@@ -212,7 +203,9 @@ async fn run_headless(
 #[derive(Debug, Clone, Copy)]
 struct RunFlags {
     use_worktree: bool,
+    cleanup_worktree: bool,
     open_pr: bool,
+    max_rounds: u32,
 }
 
 fn run_tui(
@@ -243,41 +236,38 @@ fn tui_loop<B: ratatui::backend::Backend>(
         .enable_all()
         .build()
         .context("build tokio runtime")?;
-    let (thrust_tx, thrust_rx) = ThrustChannel::new();
     let (event_tx, mut event_rx) = mpsc::channel::<RuntimeEvent>(64);
 
     let mut app = App::new();
     app.on_concierge("(tmoe) start typing. Enter to submit.".into());
     app.on_concierge("(tmoe) Ctrl-G=Go  Ctrl-P=Pause  Ctrl-K=Stop  Esc=Quit".into());
 
+    // 現在アクティブなセッションへの thrust 送信口。None ならアイドル (タスク未投入)。
+    let mut current_thrust_tx: Option<ThrustSender> = None;
     let mut runtime_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
-    let mut already_started = false;
+
+    // 初期タスクがあれば即起動。
     if let Some(task) = initial_task {
-        already_started = true;
-        let cfg_c = cfg.clone();
-        let workdir_c = workdir.clone();
-        let etx = event_tx.clone();
-        runtime_handle = Some(runtime.spawn(async move {
-            run_feature(
-                cfg_c,
-                RunOptions {
-                    task,
-                    workdir: workdir_c,
-                    use_worktree: flags.use_worktree,
-                    open_pr: flags.open_pr,
-                },
-                thrust_rx,
-                Some(etx),
-            )
-            .await
-        }));
-        app.on_concierge("(tmoe) feature spawned. Press Ctrl-G to advance.".into());
-    } else {
-        let _ = thrust_rx;
-        app.on_concierge("(tmoe) no task; provide one via the CLI: tmoe \"<task>\"".into());
+        let (tx, rx) = ThrustChannel::new();
+        // 初回の Z 軸推進を自動投入 (= ヘッドレス相当の即発進)。Concierge 経由で
+        // 後から Pause / Stop / Redirect すれば変更できる。
+        let _ = tx.send(UserThrust::Go { strength: 1.0 });
+        spawn_session(
+            &runtime,
+            cfg.clone(),
+            workdir.clone(),
+            flags,
+            task,
+            rx,
+            event_tx.clone(),
+            &mut runtime_handle,
+            &mut app,
+        );
+        current_thrust_tx = Some(tx);
     }
 
     loop {
+        // ランタイムイベントを drain して TUI 状態に反映。
         while let Ok(ev) = event_rx.try_recv() {
             match ev {
                 RuntimeEvent::Status(s) => app.status = s,
@@ -288,7 +278,16 @@ fn tui_loop<B: ratatui::backend::Backend>(
                         "(tmoe) {} {message}",
                         if ok { "✓ done:" } else { "✗ failed:" }
                     ));
+                    // セッション終了 → アイドルに戻す。次の Concierge 入力で新規セッションを spawn できる。
+                    current_thrust_tx = None;
                 }
+            }
+        }
+
+        // ランタイム task の生死を確認 (Done を受け取らずに panic した場合の保険)。
+        if let Some(h) = &runtime_handle {
+            if h.is_finished() {
+                runtime_handle = None;
             }
         }
 
@@ -304,7 +303,9 @@ fn tui_loop<B: ratatui::backend::Backend>(
                 }
                 match (k.code, k.modifiers) {
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
-                        let _ = thrust_tx.send(UserThrust::Stop);
+                        if let Some(tx) = &current_thrust_tx {
+                            let _ = tx.send(UserThrust::Stop);
+                        }
                         break;
                     }
                     _ if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -315,7 +316,13 @@ fn tui_loop<B: ratatui::backend::Backend>(
                                 UserThrust::Stop => "(Ctrl-K stop)",
                                 UserThrust::Redirect { .. } => "(redirect)",
                             };
-                            send_thrust(&thrust_tx, &mut app, thrust, label);
+                            if let Some(tx) = &current_thrust_tx {
+                                send_thrust(tx, &mut app, thrust, label);
+                            } else {
+                                app.on_concierge(
+                                    "(tmoe) no active session; type a task and press Enter".into(),
+                                );
+                            }
                         }
                     }
                     (KeyCode::Char(c), _) => {
@@ -324,9 +331,30 @@ fn tui_loop<B: ratatui::backend::Backend>(
                     (KeyCode::Backspace, _) => app.backspace(),
                     (KeyCode::Enter, _) => {
                         let line = app.take_input();
-                        if !line.is_empty() {
-                            let echo = format!("user> {line}");
-                            app.on_concierge(echo);
+                        if line.is_empty() {
+                            // 空 Enter: 何もしない。
+                        } else if current_thrust_tx.is_none() {
+                            // **アイドル時の Enter は新規セッションを spawn する**。
+                            // Concierge::translate が "go/pause/stop" のような制御語を Redirect 以外に
+                            // 分類した場合でも、アイドル時は task として扱う方が直感的。
+                            app.on_concierge(format!("user> {line}"));
+                            let (tx, rx) = ThrustChannel::new();
+                            let _ = tx.send(UserThrust::Go { strength: 1.0 });
+                            spawn_session(
+                                &runtime,
+                                cfg.clone(),
+                                workdir.clone(),
+                                flags,
+                                line,
+                                rx,
+                                event_tx.clone(),
+                                &mut runtime_handle,
+                                &mut app,
+                            );
+                            current_thrust_tx = Some(tx);
+                        } else {
+                            // セッション稼動中: 通常の thrust ルートへ。
+                            app.on_concierge(format!("user> {line}"));
                             let thrust = translate(&line);
                             let label = match &thrust {
                                 UserThrust::Go { strength } => format!("(go strength={strength})"),
@@ -336,27 +364,12 @@ fn tui_loop<B: ratatui::backend::Backend>(
                                     format!("(redirect: {instruction})")
                                 }
                             };
-                            send_thrust(&thrust_tx, &mut app, thrust, &label);
-                            if !already_started {
-                                app.on_warning(
-                                    "(tmoe) interactive task spawn from TUI not wired yet — \
-                                     restart with: tmoe \"<task>\""
-                                        .into(),
-                                );
+                            if let Some(tx) = &current_thrust_tx {
+                                send_thrust(tx, &mut app, thrust, &label);
                             }
                         }
                     }
                     _ => {}
-                }
-            }
-        }
-
-        if let Some(h) = &runtime_handle {
-            if h.is_finished() {
-                while let Ok(ev) = event_rx.try_recv() {
-                    if let RuntimeEvent::TrioLog(s) | RuntimeEvent::Status(s) = ev {
-                        app.on_trio(s);
-                    }
                 }
             }
         }
@@ -366,6 +379,29 @@ fn tui_loop<B: ratatui::backend::Backend>(
         let _ = runtime.block_on(async { h.await });
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_session(
+    runtime: &tokio::runtime::Runtime,
+    cfg: config::Config,
+    workdir: PathBuf,
+    flags: RunFlags,
+    task: String,
+    thrust_rx: tmoe_core::ThrustReceiver,
+    event_tx: mpsc::Sender<RuntimeEvent>,
+    runtime_handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+    app: &mut App,
+) {
+    *runtime_handle = Some(runtime.spawn(async move {
+        let mut opts = RunOptions::new(task, workdir);
+        opts.use_worktree = flags.use_worktree;
+        opts.cleanup_worktree = flags.cleanup_worktree;
+        opts.open_pr = flags.open_pr;
+        opts.max_rounds = flags.max_rounds;
+        run_feature(cfg, opts, thrust_rx, Some(event_tx)).await
+    }));
+    app.on_concierge("(tmoe) feature spawned.".into());
 }
 
 fn send_thrust(tx: &ThrustSender, app: &mut App, thrust: UserThrust, label: &str) {
