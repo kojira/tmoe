@@ -114,6 +114,32 @@ impl OpenAiCompatClient {
     /// 短い HTTP one-shot で確認することで、初見ユーザーが reqwest スタックトレースに
     /// 直面するのを避ける。
     pub async fn health_check(&self) -> Result<HealthStatus> {
+        // Backend::Codex は ChatGPT サブスク経由のエンドポイントで `/v1/models` 相当が無い。
+        // ここで `<base_url>/models` を GET すると 404 が返って preflight が常に死ぬので、
+        // auth.json の有無 + access_token の最低限のチェックで代替する。
+        if self.config.backend == Backend::Codex {
+            let path = self
+                .config
+                .codex_auth_path
+                .clone()
+                .unwrap_or_else(crate::codex::default_auth_path);
+            let main_model = self.config.main_model.clone();
+            let probe_url = Url::parse(crate::codex::CODEX_API_ENDPOINT).map_err(LlmError::from)?;
+            let (ok, status_code) = match crate::codex::load_codex_auth(&path) {
+                Ok(Some(a)) if !a.access_token.is_empty() => (true, 200u16),
+                Ok(Some(_)) => (false, 401),
+                Ok(None) => (false, 0), // not authenticated
+                Err(_) => (false, 0),
+            };
+            return Ok(HealthStatus {
+                url: probe_url,
+                ok,
+                status_code,
+                main_model_visible: ok,
+                main_model,
+            });
+        }
+
         let mut url = self.config.base_url.clone();
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));

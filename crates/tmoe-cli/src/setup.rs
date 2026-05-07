@@ -111,6 +111,18 @@ fn read_line(prompt: &str, default: Option<&str>) -> Result<String> {
 
 async fn setup_codex(path: &Path) -> Result<()> {
     println!();
+    println!("⚠ Codex backend is experimental in this version of tmoe.");
+    println!("  - OAuth login + token refresh: working");
+    println!("  - Chat protocol translation (chat/completions ↔ OpenAI Responses API):");
+    println!("    NOT yet implemented. Actual chat calls will likely fail with a");
+    println!("    protocol-level error. Use Rapid-MLX / llama.cpp / vLLM for real work");
+    println!("    until tmoe v0.3.0 lands the Responses API client.");
+    println!();
+    let cont = read_line("Continue with Codex login anyway? [y/N]", Some("n"))?;
+    if !matches!(cont.to_lowercase().as_str(), "y" | "yes") {
+        println!("Aborted. Re-run `tmoe init` to pick another backend.");
+        return Ok(());
+    }
     let model = read_line("Codex model (e.g. gpt-5.4)", Some("gpt-5.4"))?;
     write_config_toml(
         path,

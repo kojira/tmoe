@@ -496,6 +496,11 @@ fn tui_loop<B: ratatui::backend::Backend>(
         terminal.draw(|f| {
             let area = f.area();
             (&app).render(area, f.buffer_mut());
+            // 入力プロンプトの末尾にカーソルを置く。これをやらないと macOS Terminal の
+            // 日本語 IME が pre-edit テキストを「最後にカーソルがあった場所」に描いてしまい、
+            // 結果として alternate screen が予期せずスクロールして TUI 全体が崩れる。
+            let (cx, cy) = app.cursor_position(area);
+            f.set_cursor_position(ratatui::layout::Position::new(cx, cy));
         })?;
 
         if event::poll(Duration::from_millis(150))? {

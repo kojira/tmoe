@@ -32,6 +32,39 @@ pub struct App {
 }
 
 impl App {
+    /// 入力プロンプトの末尾 (= IME pre-edit / 通常の caret) を置くべき画面座標を計算する。
+    /// `area` は描画ターゲット全体 (= `Frame::area()`)。レイアウトは `render` と同じ計算。
+    /// macOS Terminal の IME は OS 側のカーソル位置に pre-edit を描くので、これを設定し
+    /// 忘れると pre-edit が想定外の場所に出て画面が崩れる。
+    pub fn cursor_position(&self, area: Rect) -> (u16, u16) {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(7), Constraint::Length(3)])
+            .split(area);
+        let middle = outer[0];
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(middle);
+        let concierge_pane = cols[0];
+        // Concierge ペインの中、input_buffer の末尾位置:
+        //   x = pane.x + 1 (left border) + display width of input_buffer
+        //   y = pane.y + pane.height - 2 (bottom border above)
+        let input_visible_width = self.input_buffer.chars().fold(0u16, |acc, c| {
+            // CJK 全角文字は 2 列、それ以外は 1 列で概算 (unicode-width の正確版を入れない代わりの近似)。
+            let w = if c as u32 >= 0x1100 { 2 } else { 1 };
+            acc.saturating_add(w)
+        });
+        let x = concierge_pane.x.saturating_add(1).saturating_add(input_visible_width);
+        let y = concierge_pane
+            .y
+            .saturating_add(concierge_pane.height.saturating_sub(2));
+        (
+            x.min(concierge_pane.x.saturating_add(concierge_pane.width.saturating_sub(2))),
+            y,
+        )
+    }
+
     pub fn new() -> Self {
         Self {
             status: "tmoe ready — 3 + 1 mode".into(),
