@@ -68,6 +68,9 @@ JSON で {"next": ["id1", "id2", ...], "terminal": bool, "leaves": ["id", ...]} 
                 ChatMessage::system(tmoe_prompts_navigate()),
                 ChatMessage::user(prompt),
             ],
+            // navigate の出力は 1 行 JSON。ナビゲータが暴走するのを防ぐ。
+            max_tokens: Some(256),
+            temperature: Some(0.0),
             ..Default::default()
         })
         .await
