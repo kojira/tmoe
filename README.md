@@ -17,8 +17,10 @@ cd tmoe
 cargo build --release
 
 # 2) ローカル LLM を立てる (Apple Silicon の例)
-brew install --cask rapid-mlx        # 初回のみ
+#    Rapid-MLX は 3rd-party tap で配布されている。初回のみ tap が必要。
+brew install raullenchai/rapid-mlx/rapid-mlx
 rapid-mlx serve qwen3-coder-30b --port 8081 &
+# 初回起動時は Hugging Face からモデル (4bit 量子化で 18GB 程度) を取得するので時間がかかる。
 
 # 3) 環境を診断 (この 1 コマンドで設定/接続/オプショナル bin が表示される)
 ./target/release/tmoe doctor
