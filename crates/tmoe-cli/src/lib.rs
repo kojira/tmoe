@@ -4,6 +4,7 @@
 //! 同じ crate に lib も載せて test/再利用に開く。
 //! バイナリ実体は `src/main.rs` 側で `use tmoe_cli::...` する。
 
+pub mod agents_md;
 pub mod app;
 pub mod concierge;
 pub mod config;

@@ -41,6 +41,7 @@ use tmoe_tools::{
     WebFetchTool, WebSearchTool, WorktreeHandle,
 };
 
+use crate::agents_md;
 use crate::source_tool::SearchSourceTool;
 use tokio::sync::mpsc;
 
@@ -201,8 +202,25 @@ pub async fn run_feature(
         max_iter_per_step: cfg.trio.max_iter_per_step,
     });
 
+    // AGENTS.md (および TMOE.md) を work_root から git ルート (or HOME) まで集める。
+    // 浅い階層が先に来るので Worker は「プロジェクト全体ルール → サブディレクトリ固有」
+    // の順に重ね合わせて読める。
+    let agents_ctx = agents_md::collect(&work_root);
+    if !agents_ctx.is_empty() {
+        let names: Vec<String> = agents_ctx
+            .files
+            .iter()
+            .map(|f| f.path.display().to_string())
+            .collect();
+        status(format!("project instructions loaded: {} file(s)", names.len()));
+        for n in &names {
+            say(format!("  - {n}"));
+        }
+    }
+    let agents_block = agents_ctx.render_for_prompt();
+
     let initial_prompt = format!(
-        "{task}\n\n\
+        "{agents}{task}\n\n\
          Available tools (call as a fenced ```json block with {{\"tool\":\"name\",\"args\":{{...}}}}):\n\
          - edit_file / read_file: full-file write or read\n\
          - patch_file: search/replace inside an existing file\n\
@@ -212,6 +230,7 @@ pub async fn run_feature(
          - run_cmd: run a shell command (denylist enforced)\n\
          - web_search / web_fetch: optional, requires obscura on PATH\n\
          When you finish, emit a single line containing only DONE.",
+        agents = agents_block,
         task = opts.task,
     );
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(initial_prompt)];

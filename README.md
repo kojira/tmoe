@@ -208,6 +208,24 @@ Worker からの呼び出し例:
 {"tool":"web_fetch","args":{"url":"https://docs.vllm.ai/en/latest/features/spec_decode.html"}}
 ```
 
+## プロジェクト固有の指示 (AGENTS.md)
+
+ワークディレクトリに `AGENTS.md` を置くと、tmoe はそれを Worker の初期プロンプトに
+prepend する。git ルートからサブディレクトリまで遡って収集し、**ルート (浅い階層) →
+リーフ (深い階層) の順** で連結するので、プロジェクト全体ルールはルートに、
+モジュール固有の制約はサブディレクトリに置けば階層的に適用される。
+
+例:
+```markdown
+# AGENTS.md
+- All output files must contain TMOE_PROJECT_RULE on the first line as a comment.
+- Use snake_case for filenames.
+- Never use `unwrap()` in production code; prefer explicit error handling.
+```
+
+同階層に `TMOE.md` があれば AGENTS.md の後に重ねて読む (= tmoe 固有の上書きを許す)。
+空ファイルや空白だけのファイルは無視される。
+
 ## 詳しい設定
 
 設定は以下の優先順位で解決される:
