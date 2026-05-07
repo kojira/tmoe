@@ -15,7 +15,10 @@ pub mod thrust;
 pub mod trio;
 pub mod vote;
 
-pub use agent::{single_agent_loop, AgentRole, ParsedToolCall, ProposalMessage};
+pub use agent::{
+    run_worker_until_verified, single_agent_loop, AgentRole, ParsedToolCall, ProgressVerifier,
+    ProposalMessage, VerifierOutcome, WorkerRunResult,
+};
 pub(crate) use agent::{extract_bool_field, extract_number_field, extract_simple_string_field, lenient_jsonify};
 pub use proposal::Proposal;
 pub use self_review::{supervisor_review_diff, SelfReviewOutcome};

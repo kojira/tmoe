@@ -28,4 +28,5 @@ tmoe-prompts.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 url.workspace = true
+async-trait.workspace = true
 tmoe-history.workspace = true

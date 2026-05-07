@@ -343,6 +343,73 @@ pub struct ProposalMessage {
     pub tool_outputs: Vec<Result<tmoe_tools::ToolOutput, ToolError>>,
 }
 
+/// 進行確認フック (Concierge / Verifier 役)。
+///
+/// 各ターン終了後に呼ばれ、機械的事実 (例: ファイルシステム状態, テスト合格判定など)
+/// を返す。`Outcome::Done` ならループ脱出、`Outcome::Continue { hint }` なら hint を
+/// 次ターンの Worker への user メッセージに注入する。これは tmoe の Concierge =
+/// 「ユーザー Z 軸推進力 + 機械的事実伝達」の役割を、Worker 駆動ループに組み込んだもの。
+///
+/// 用例: リファクタリング完了確認 (grep ヒット 0)、テスト合格 (`cargo test` exit 0)、
+/// 必須ファイル存在チェック、等。
+#[async_trait::async_trait]
+pub trait ProgressVerifier: Send + Sync {
+    async fn verify(&self) -> VerifierOutcome;
+}
+
+#[derive(Debug, Clone)]
+pub enum VerifierOutcome {
+    /// 完了。ループ脱出。
+    Done,
+    /// 未完了。Worker への次ターン user メッセージに `hint` を注入する。
+    Continue { hint: String },
+}
+
+/// run_worker_until_verified の戻り値。
+#[derive(Debug)]
+pub struct WorkerRunResult {
+    pub turns: u32,
+    pub completed: bool,
+    pub last: Option<ProposalMessage>,
+}
+
+/// Worker を多ターン駆動し、毎ターン後に `verifier` で進行を確認する。
+/// Verifier が `Done` を返したら脱出 (= 真の完了)。`Continue { hint }` なら hint を
+/// Worker への次ターン user に注入して継続する。`max_turns` で打ち切り。
+///
+/// この helper は e2e と production で共通に使える「Worker × Concierge 進行確認」の
+/// 汎用ループ。Worker への履歴注入戦略 (= summary view など) は呼び出し側が
+/// `next_user_messages` クロージャで構築する責任を持つ。
+pub async fn run_worker_until_verified<F, V>(
+    system: &str,
+    llm: &dyn tmoe_llm::LlmClient,
+    tools: &tmoe_tools::ToolRegistry,
+    verifier: &V,
+    max_turns: u32,
+    mut next_user_messages: F,
+) -> anyhow::Result<WorkerRunResult>
+where
+    V: ProgressVerifier + ?Sized,
+    F: FnMut(u32, Option<&ProposalMessage>, &str) -> Vec<tmoe_llm::ChatMessage>,
+{
+    let mut last: Option<ProposalMessage> = None;
+    let mut last_hint = String::new();
+    for t in 0..max_turns {
+        let user_messages = next_user_messages(t, last.as_ref(), &last_hint);
+        let pm = single_agent_loop(AgentRole::Worker, system, user_messages, llm, tools).await?;
+        last = Some(pm);
+        match verifier.verify().await {
+            VerifierOutcome::Done => {
+                return Ok(WorkerRunResult { turns: t + 1, completed: true, last });
+            }
+            VerifierOutcome::Continue { hint } => {
+                last_hint = hint;
+            }
+        }
+    }
+    Ok(WorkerRunResult { turns: max_turns, completed: false, last })
+}
+
 /// 単体エージェントを 1 ステップだけ回す: LLM へ問い、Proposal を抽出し、Worker 役割なら
 /// ツールを実行する。Phase 4 ではこの 1 ステップが Trio の `worker.act` に相当する。
 pub async fn single_agent_loop(

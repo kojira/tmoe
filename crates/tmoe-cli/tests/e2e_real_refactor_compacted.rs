@@ -13,11 +13,14 @@
 use std::env;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tmoe_core::{single_agent_loop, AgentRole, ProposalMessage};
-use tmoe_history::{
-    compact_turn_for_all, AgentLens, AgentView, AppendRaw, HistoryStore, LabeledLens, RawKind,
+use tmoe_core::{
+    single_agent_loop, AgentRole, ProgressVerifier, ProposalMessage, VerifierOutcome,
 };
-use tmoe_llm::{Backend, ChatMessage, OpenAiCompatClient, OpenAiCompatConfig};
+use tmoe_history::{
+    compact_turn_for_all, AgentLens, AgentView, AppendRaw, HistoryStore, LlmLens, RawKind,
+};
+use tmoe_llm::{Backend, ChatMessage, LlmClient, OpenAiCompatClient, OpenAiCompatConfig};
+use tmoe_prompts::{OBSERVER_SYSTEM, SUPERVISOR_SYSTEM, WORKER_SYSTEM};
 use tmoe_tools::{
     GrepTextTool, ListFilesTool, PatchFileTool, ReadFileTool, ToolRegistry,
 };
@@ -40,7 +43,9 @@ CRITICAL refactor rules:
   - When renaming an identifier, set search to the BARE token (e.g. "old_name"), NOT
     a multi-line surrounding snippet. Multi-line searches are fragile and often fail.
   - Use replace_all=true so all occurrences in a file are replaced atomically.
-  - Issue ONE patch_file per file in a single turn when possible.
+  - When the [concierge] message lists multiple files, emit ONE patch_file per file
+    in the SAME turn (multiple ```json blocks). Do NOT spread file edits across many
+    turns — one turn should knock out all listed files.
 
 Output ONE OR MORE ```json blocks per turn. Do NOT include prose.
 "#;
@@ -109,11 +114,33 @@ path = "src/lib.rs"
     d
 }
 
-fn lenses() -> Vec<Box<dyn AgentLens>> {
+fn lenses(llm: Arc<dyn LlmClient>) -> Vec<Box<dyn AgentLens>> {
+    // 本物の LlmLens を使う。3 つの Lens は同一 LLM クライアントを共有しつつ、
+    // パーソナリティプロンプト (tmoe-prompts) で 3 つの異なる方向性ベクトルを表現。
+    // 各ターン後に追加 LLM 呼び出し 3 回が走るが、Worker への context は固定サイズの
+    // summary に圧縮されるので、ターン数を重ねても request body は爆発しない。
+    let tighten = |sys: &str| -> String {
+        // 要約 LLM への system は短く絞る。tmoe-prompts のフルプロンプトは Worker 駆動用なので
+        // ここでは Lens の役割だけを伝える短い系統に置換。
+        sys.lines().take(3).collect::<Vec<_>>().join("\n")
+    };
     vec![
-        Box::new(LabeledLens { agent: AgentView::Worker, label: "build" }),
-        Box::new(LabeledLens { agent: AgentView::Supervisor, label: "critique" }),
-        Box::new(LabeledLens { agent: AgentView::Observer, label: "witness" }),
+        Box::new({
+            let mut l = LlmLens::new(AgentView::Worker, tighten(WORKER_SYSTEM), llm.clone());
+            l.max_summary_chars = 1500;
+            l
+        }),
+        Box::new({
+            let mut l =
+                LlmLens::new(AgentView::Supervisor, tighten(SUPERVISOR_SYSTEM), llm.clone());
+            l.max_summary_chars = 1000;
+            l
+        }),
+        Box::new({
+            let mut l = LlmLens::new(AgentView::Observer, tighten(OBSERVER_SYSTEM), llm);
+            l.max_summary_chars = 1000;
+            l
+        }),
     ]
 }
 
@@ -167,20 +194,21 @@ async fn real_llm_multifile_refactor_with_personality_compaction() {
             return;
         }
     };
-    let llm = OpenAiCompatClient::new(cfg).unwrap();
+    let llm: Arc<dyn LlmClient> = Arc::new(OpenAiCompatClient::new(cfg).unwrap());
 
     let work = fixture();
     let root = work.path().to_path_buf();
     let reg = registry(root.clone());
 
     // tmoe-history を起動。各ターンの raw + 3 view を本物の HistoryStore に書き、
-    // Worker view summary を次ターンの context に注入する。
+    // Worker view summary を次ターンの context に注入する。3 view の Lens は **LlmLens**
+    // (= 各エージェントが自分のパーソナリティで取捨選択して要約) を使う。
     let store_dir = tempdir().unwrap();
     let store = HistoryStore::open(store_dir.path()).unwrap();
     let feature = store
         .create_feature("rename old_name -> new_name across demo_pkg")
         .unwrap();
-    let lenses = lenses();
+    let lenses = lenses(llm.clone());
 
     let task = ChatMessage::user(
         "Rename the identifier `old_name` to `new_name` in EVERY file under src/ and \
@@ -190,25 +218,65 @@ async fn real_llm_multifile_refactor_with_personality_compaction() {
          tests/it.rs. After all three patches, you may stop.",
     );
 
-    // 直近 raw 出力。Worker view summary とは別に、最新の生情報も渡す。
+    // 直近 raw 出力 + 毎ターン Concierge が機械的に確認する **残タスク fact**。
     let mut last_raw_outputs = String::new();
     let mut last_raw_lens: Vec<usize> = Vec::new();
 
+    // Concierge / Verifier 役を tmoe-core::ProgressVerifier の実装として外出しする。
+    // これは task-specific (rename target) だが、**機構自体は汎用** で、tmoe-core の
+    // 汎用 helper `run_worker_until_verified` から同じ trait オブジェクトを呼べる。
+    struct RenameVerifier {
+        root: std::path::PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl ProgressVerifier for RenameVerifier {
+        async fn verify(&self) -> VerifierOutcome {
+            use tmoe_tools::Tool;
+            match (GrepTextTool { root: self.root.clone() })
+                .call(&serde_json::json!({"pattern": "old_name"}))
+                .await
+            {
+                Ok(o) if o.stdout.trim().is_empty() => VerifierOutcome::Done,
+                Ok(o) => VerifierOutcome::Continue {
+                    hint: format!(
+                        "[concierge] occurrences of `old_name` STILL PRESENT — you MUST issue \
+                         patch_file (search=\"old_name\", replace_all=true) for each file below:\n{}",
+                        o.stdout
+                    ),
+                },
+                Err(e) => VerifierOutcome::Continue {
+                    hint: format!("[concierge] residual scan failed: {e}"),
+                },
+            }
+        }
+    }
+    let verifier = RenameVerifier { root: root.clone() };
+
     for turn_idx in 0..8 {
-        // Worker への入力: task + Worker view summary + 直近 raw 出力。
-        // 過去ターンの assistant 発話そのものは渡さず、サマリで圧縮する。
+        // 各ターン頭で機械的事実 (= 残タスク) を取得する。Done なら即脱出。
+        let outstanding_msg = match verifier.verify().await {
+            VerifierOutcome::Done => {
+                eprintln!("verifier: rename complete before turn {turn_idx}");
+                break;
+            }
+            VerifierOutcome::Continue { hint } => hint,
+        };
+
+        // Worker の自己 view は Worker 自身に渡さない (自己欺瞞を温存するため)。
+        // 代わりに Supervisor view (= 失敗指摘) を渡し、何が残っているかを批判軸経由で示す。
         let mut messages = vec![task.clone()];
-        if let Some(view) = store
-            .latest_level0(&feature.id, AgentView::Worker)
+        if let Some(sup_view) = store
+            .latest_level0(&feature.id, AgentView::Supervisor)
             .unwrap()
         {
-            if !view.summary.trim().is_empty() {
+            if !sup_view.summary.trim().is_empty() {
                 messages.push(ChatMessage::user(format!(
-                    "[your worker-view memory of progress so far]\n{}",
-                    view.summary
+                    "[supervisor critique so far — read carefully and address every point]\n{}",
+                    sup_view.summary
                 )));
             }
         }
+        messages.push(ChatMessage::user(outstanding_msg.clone()));
         if !last_raw_outputs.is_empty() {
             messages.push(ChatMessage::user(format!(
                 "[most recent tool outputs]\n{}",
@@ -222,7 +290,7 @@ async fn real_llm_multifile_refactor_with_personality_compaction() {
             AgentRole::Worker,
             WORKER_PROMPT,
             messages,
-            &llm,
+            llm.as_ref(),
             &reg,
         )
         .await
