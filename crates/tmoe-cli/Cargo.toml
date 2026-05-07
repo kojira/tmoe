@@ -23,6 +23,11 @@ tmoe-tree.workspace = true
 tmoe-rag.workspace = true
 tmoe-tools.workspace = true
 tmoe-prompts.workspace = true
+toml.workspace = true
+dirs.workspace = true
+url.workspace = true
+git2.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile.workspace = true
