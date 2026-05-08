@@ -7,6 +7,89 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tmoe_core::UserThrust;
+use tmoe_llm::{ChatMessage, ChatRequest, LlmClient};
+
+/// アイドル時 Enter のルーティング判定結果。`classify_route` の戻り値。
+///
+/// **task vs chat の判定は LLM が決める** (= 文字列マッチ禁止)。CLI ビルトインコマンド
+/// (`help` / `quit` / `exit`) は呼び出し側で先に短絡されるので、`classify_route` には
+/// 来ない前提。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// ファイル変更を伴う作業 → 通常の Trio セッション spawn。
+    Task,
+    /// 雑談・挨拶・メタ質問 → そのまま左ペインに `reply` を表示して終了。
+    Chat { reply: String },
+}
+
+/// LLM の生応答テキストから `Route` を取り出す純粋関数。HTTP コールは含まない (= test 容易)。
+///
+/// 想定する正解フォーマット:
+///   `{"route":"task"}`
+///   `{"route":"chat","reply":"<text>"}`
+///
+/// パースに失敗した場合や `route` の値が不明だった場合は **task に倒す** (= 安全側)。
+/// chat 誤分類は被害甚大 (= 実装依頼を放置) だが、task 誤分類は worktree carve + 空提案で
+/// 第二防壁が回収できるため。
+///
+/// LLM が markdown フェンスや prose を混ぜてくることを許容するため、最初の `{` から最後の `}`
+/// までを取り出してから serde_json に渡す (= history_tool::parse_pick / trio::parse_vote と
+/// 同じ leniency)。
+pub fn parse_route(text: &str) -> Route {
+    let trimmed = text.trim();
+    let start = match trimmed.find('{') {
+        Some(i) => i,
+        None => return Route::Task,
+    };
+    let end = match trimmed.rfind('}') {
+        Some(i) if i > start => i,
+        _ => return Route::Task,
+    };
+    let payload = &trimmed[start..=end];
+
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        route: Option<String>,
+        #[serde(default)]
+        reply: Option<String>,
+    }
+    let raw: Raw = match serde_json::from_str(payload) {
+        Ok(r) => r,
+        Err(_) => return Route::Task,
+    };
+    match raw.route.as_deref() {
+        Some("chat") => Route::Chat {
+            reply: raw.reply.unwrap_or_default().trim().to_string(),
+        },
+        Some("task") => Route::Task,
+        // 不明な route 値は安全側で task。
+        _ => Route::Task,
+    }
+}
+
+/// アイドル時の Enter 入力を LLM に分類させる。判定基準は `tmoe_prompts::CONCIERGE_SYSTEM`
+/// に書いてある (= 概念で書く、キーワードリスト禁止)。
+///
+/// 失敗時 (LLM HTTP エラー / parse 不能) は `Route::Task` に倒す (= 安全側)。呼び出し側は
+/// この戻り値だけを見て分岐すれば良く、エラー処理は不要。
+pub async fn classify_route(llm: &dyn LlmClient, input: &str) -> Route {
+    let req = ChatRequest {
+        messages: vec![
+            ChatMessage::system(tmoe_prompts::CONCIERGE_SYSTEM),
+            ChatMessage::user(input.to_string()),
+        ],
+        max_tokens: Some(256),
+        temperature: Some(0.2),
+        ..Default::default()
+    };
+    match llm.chat(req).await {
+        Ok(resp) => parse_route(&resp.content),
+        Err(e) => {
+            tracing::warn!("classify_route LLM error: {e}; falling back to task");
+            Route::Task
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConciergeIntent {
@@ -209,5 +292,81 @@ mod tests {
     fn unrelated_ctrl_keys_ignored() {
         assert!(key_to_thrust(ctrl('a')).is_none());
         assert!(key_to_thrust(ctrl('z')).is_none());
+    }
+
+    // ---- LLM-driven route classifier (idle-time Enter only) ----
+
+    #[test]
+    fn parse_route_task_minimal() {
+        assert_eq!(parse_route(r#"{"route":"task"}"#), Route::Task);
+    }
+
+    #[test]
+    fn parse_route_chat_with_reply() {
+        match parse_route(r#"{"route":"chat","reply":"hello"}"#) {
+            Route::Chat { reply } => assert_eq!(reply, "hello"),
+            other => panic!("expected chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_route_chat_japanese_reply_preserved() {
+        match parse_route(r#"{"route":"chat","reply":"こんにちは！"}"#) {
+            Route::Chat { reply } => assert_eq!(reply, "こんにちは！"),
+            other => panic!("expected chat, got {other:?}"),
+        }
+    }
+
+    /// LLM が markdown フェンスを巻いてきても剥がして parse できる (= history_tool::parse_pick
+    /// と同じ leniency)。
+    #[test]
+    fn parse_route_strips_markdown_fences() {
+        let body = "```json\n{\"route\":\"task\"}\n```";
+        assert_eq!(parse_route(body), Route::Task);
+    }
+
+    /// JSON parse 不能 → task に倒す (安全側)。
+    #[test]
+    fn parse_route_unparseable_falls_back_to_task() {
+        assert_eq!(parse_route("not json"), Route::Task);
+        assert_eq!(parse_route(r#"{"route":"#), Route::Task);
+        assert_eq!(parse_route(""), Route::Task);
+    }
+
+    /// 不明な route 値も task に倒す。
+    #[test]
+    fn parse_route_unknown_route_value_falls_back_to_task() {
+        assert_eq!(parse_route(r#"{"route":"weird"}"#), Route::Task);
+        assert_eq!(parse_route(r#"{"foo":"bar"}"#), Route::Task);
+    }
+
+    #[tokio::test]
+    async fn classify_route_with_mock_chat() {
+        use tmoe_llm::{MockLlmClient, ScriptedTurn};
+        let llm = MockLlmClient::new("classifier");
+        llm.push(ScriptedTurn::new(r#"{"route":"chat","reply":"hi"}"#));
+        match classify_route(&llm, "hello").await {
+            Route::Chat { reply } => assert_eq!(reply, "hi"),
+            other => panic!("expected chat, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_route_with_mock_task() {
+        use tmoe_llm::{MockLlmClient, ScriptedTurn};
+        let llm = MockLlmClient::new("classifier");
+        llm.push(ScriptedTurn::new(r#"{"route":"task"}"#));
+        assert_eq!(
+            classify_route(&llm, "add hello() to src/main.rs").await,
+            Route::Task
+        );
+    }
+
+    /// LLM 呼び出しが失敗 (MockExhausted) → fallback で Task に倒れる。
+    #[tokio::test]
+    async fn classify_route_falls_back_to_task_on_llm_error() {
+        use tmoe_llm::MockLlmClient;
+        let llm = MockLlmClient::new("classifier"); // script 空 = エラー
+        assert_eq!(classify_route(&llm, "anything").await, Route::Task);
     }
 }

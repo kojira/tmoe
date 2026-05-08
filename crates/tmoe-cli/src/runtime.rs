@@ -57,6 +57,14 @@ pub enum RuntimeEvent {
     Status(String),
     TrioLog(String),
     Warning(String),
+    /// 左 Concierge ペインに "(tmoe) ..." として表示する短い返事。
+    /// 第一防壁 (LLM classifier の chat ルート) と第二防壁 (`tool_calls.is_empty()`) の
+    /// 両方から流れる。Trio Worker streaming sink (= TrioLog) と混線しないよう専用バリアント。
+    ConciergeReply(String),
+    /// classifier task の判定結果を main loop に届ける制御信号。
+    /// `Route::Task` なら main loop が `spawn_session` を呼ぶ。`Route::Chat` の reply 自体は
+    /// 別途 ConciergeReply で流れるので、ここでは route のタグだけ運ぶ。
+    Routed { task: bool, user_input: String },
     Done { ok: bool, message: String },
 }
 
@@ -418,6 +426,7 @@ pub async fn run_feature(
                     task = opts.task,
                     raw = proposal.raw_text
                 );
+                let no_op = proposal.tool_calls.is_empty();
                 last_committed = Some((
                     AppendRaw {
                         feature_id: feature.id.clone(),
@@ -427,6 +436,18 @@ pub async fn run_feature(
                     },
                     raw_body,
                 ));
+                if no_op {
+                    // ③ 防壁: Worker が proposal で 1 つもツールを呼ばなかった = chat に近い回答。
+                    // worktree commit / PR / 3 view compaction は全部スキップ。Worker の prose
+                    // (= proposal.note の中身) をそのまま左 Concierge ペインに返事として流す。
+                    let reply = proposal.note.trim().to_string();
+                    if !reply.is_empty() {
+                        if let Some(tx) = &event_tx {
+                            let _ = tx.try_send(RuntimeEvent::ConciergeReply(reply.clone()));
+                        }
+                    }
+                    break SessionOutcome::CommittedNoOp { note: reply };
+                }
                 break SessionOutcome::Committed;
             }
             ConsensusOutcome::Redirected { instruction } => {
@@ -470,8 +491,10 @@ pub async fn run_feature(
         }
     };
 
-    // --- 6) Persist + compact (Commit のみ)
-    if let SessionOutcome::Committed = &session_outcome {
+    // --- 6) Persist + compact (Commit のみ; CommittedNoOp は raw 追記だけして compaction はスキップ)
+    let is_real_commit = matches!(session_outcome, SessionOutcome::Committed);
+    let is_no_op = matches!(session_outcome, SessionOutcome::CommittedNoOp { .. });
+    if is_real_commit || is_no_op {
         if let Some((append, raw_body)) = last_committed.clone() {
             let raw = match store.append_raw(append) {
                 Ok(r) => r,
@@ -484,44 +507,64 @@ pub async fn run_feature(
                         &say,
                         &warn,
                         false,
+                        false,
                     );
                     done(&event_tx, false, "raw append failed".into());
                     return Ok(());
                 }
             };
-            let lenses: Vec<Box<dyn AgentLens>> = vec![
-                Box::new(LlmLens::new(
-                    AgentView::Worker,
-                    tmoe_prompts::WORKER_SYSTEM,
-                    llm.clone(),
-                )),
-                Box::new(LlmLens::new(
-                    AgentView::Supervisor,
-                    tmoe_prompts::SUPERVISOR_SYSTEM,
-                    llm.clone(),
-                )),
-                Box::new(LlmLens::new(
-                    AgentView::Observer,
-                    tmoe_prompts::OBSERVER_SYSTEM,
-                    llm.clone(),
-                )),
-            ];
-            if let Err(e) =
-                compact_turn_for_all(&store, &feature.id, &raw, &raw_body, &lenses).await
-            {
-                warn(format!("compaction error (history not updated): {e}"));
-            } else {
-                status("3 views updated by personality compaction".into());
+            // 3 view 並走逐次コンパクションは「実装が進んだ」場合のみ走らせる。
+            // CommittedNoOp は空 view を 3 つ作るだけで価値ゼロなのでスキップ。
+            if is_real_commit {
+                let lenses: Vec<Box<dyn AgentLens>> = vec![
+                    Box::new(LlmLens::new(
+                        AgentView::Worker,
+                        tmoe_prompts::WORKER_SYSTEM,
+                        llm.clone(),
+                    )),
+                    Box::new(LlmLens::new(
+                        AgentView::Supervisor,
+                        tmoe_prompts::SUPERVISOR_SYSTEM,
+                        llm.clone(),
+                    )),
+                    Box::new(LlmLens::new(
+                        AgentView::Observer,
+                        tmoe_prompts::OBSERVER_SYSTEM,
+                        llm.clone(),
+                    )),
+                ];
+                if let Err(e) =
+                    compact_turn_for_all(&store, &feature.id, &raw, &raw_body, &lenses).await
+                {
+                    warn(format!("compaction error (history not updated): {e}"));
+                } else {
+                    status("3 views updated by personality compaction".into());
+                }
             }
         }
     }
 
     // --- 7) Worktree commit + (optional) PR + (optional) cleanup
-    let committed = matches!(session_outcome, SessionOutcome::Committed);
-    finalize_worktree(&worktree_handle, &opts, &feature.id, &say, &warn, committed);
+    // committed=true は git commit + (optional) PR を走らせる。CommittedNoOp は git commit せず、
+    // ただし worktree branch は強制削除して `git worktree list` を汚さない。
+    let committed = is_real_commit;
+    let force_cleanup = is_no_op;
+    finalize_worktree(
+        &worktree_handle,
+        &opts,
+        &feature.id,
+        &say,
+        &warn,
+        committed,
+        force_cleanup,
+    );
 
     let (ok, msg) = match session_outcome {
         SessionOutcome::Committed => (true, format!("feature {} committed in {} round(s)", feature.id, rounds_used)),
+        SessionOutcome::CommittedNoOp { note } => {
+            let preview = short(&note, 80);
+            (true, format!("no file changes ({preview})"))
+        }
         SessionOutcome::Stopped => (false, "stopped by user".into()),
         SessionOutcome::Escalated => (false, "escalated (Trio could not form plane)".into()),
         SessionOutcome::Aborted(reason) => (false, format!("aborted: {reason}")),
@@ -533,11 +576,19 @@ pub async fn run_feature(
 #[derive(Debug, Clone)]
 enum SessionOutcome {
     Committed,
+    /// Worker が tool を 1 つも呼ばなかった (= chat に近い回答だけだった) ケース。
+    /// `note` は Worker の prose (返事本文)。worktree も commit も作らず、
+    /// `ConciergeReply` で左ペインに返事を流して終わる。
+    CommittedNoOp {
+        note: String,
+    },
     Stopped,
     Escalated,
     Aborted(String),
 }
 
+// `force_cleanup` は `CommittedNoOp` 経路から「コミットしないが branch は消す」を要求するフラグ。
+// `opts.cleanup_worktree` が false でも、これが true なら worktree prune を実行する。
 fn finalize_worktree<F1, F2>(
     handle: &Option<WorktreeHandle>,
     opts: &RunOptions,
@@ -545,6 +596,7 @@ fn finalize_worktree<F1, F2>(
     say: &F1,
     warn: &F2,
     committed: bool,
+    force_cleanup: bool,
 ) where
     F1: Fn(String),
     F2: Fn(String),
@@ -572,10 +624,10 @@ fn finalize_worktree<F1, F2>(
             run_gh_pr_create(h, opts, feature_id, say, warn);
         }
     } else if opts.open_pr {
-        warn("session did not commit; skipping --pr".into());
+        warn("session ended with no file changes; skipping --pr".into());
     }
 
-    if opts.cleanup_worktree {
+    if opts.cleanup_worktree || force_cleanup {
         let cloned = (*h).clone();
         match cleanup_worktree(cloned) {
             Ok(()) => say(format!("worktree pruned: {}", h.worktree_path.display())),

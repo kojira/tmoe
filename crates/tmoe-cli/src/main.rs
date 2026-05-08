@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use tmoe_cli::app::App;
-use tmoe_cli::concierge::{key_to_thrust, translate};
+use tmoe_cli::concierge::{classify_route, key_to_thrust, translate, Route};
 use tmoe_cli::config;
 use tmoe_cli::runtime::{
     doctor, history_list, history_show, merge_feature, run_feature, RunOptions, RuntimeEvent,
@@ -385,6 +385,10 @@ async fn run_headless(
             RuntimeEvent::Status(s) => eprintln!("[status] {s}"),
             RuntimeEvent::TrioLog(s) => eprintln!("[trio]   {s}"),
             RuntimeEvent::Warning(s) => eprintln!("[warn]   {s}"),
+            RuntimeEvent::ConciergeReply(s) => eprintln!("[chat]   {s}"),
+            // Routed は TUI loop 用の制御シグナルで headless では用が無い (= headless は
+            // 既に "task として走れ" の前提で run_feature を回している)。無視する。
+            RuntimeEvent::Routed { .. } => {}
             RuntimeEvent::Done { ok, message } => {
                 eprintln!("[done]   ok={ok} {message}");
                 break;
@@ -475,6 +479,32 @@ fn tui_loop<B: ratatui::backend::Backend>(
                 RuntimeEvent::Status(s) => app.status = s,
                 RuntimeEvent::TrioLog(s) => app.on_trio(s),
                 RuntimeEvent::Warning(s) => app.on_warning(s),
+                RuntimeEvent::ConciergeReply(s) => {
+                    app.on_concierge(format!("(tmoe) {s}"));
+                }
+                RuntimeEvent::Routed { task, user_input } => {
+                    if task {
+                        // classifier が "task" と判定した → アイドルなら新規セッション spawn。
+                        // (current_thrust_tx が Some なら既に走っているはずで、再 spawn は不要)
+                        if current_thrust_tx.is_none() {
+                            let (tx, rx) = ThrustChannel::new();
+                            let _ = tx.send(UserThrust::Go { strength: 1.0 });
+                            spawn_session(
+                                &runtime,
+                                cfg.clone(),
+                                workdir.clone(),
+                                flags.clone(),
+                                user_input,
+                                rx,
+                                event_tx.clone(),
+                                &mut runtime_handle,
+                                &mut app,
+                            );
+                            current_thrust_tx = Some(tx);
+                        }
+                    }
+                    // chat の場合: ConciergeReply 側で表示済みなので何もしない。
+                }
                 RuntimeEvent::Done { ok, message } => {
                     app.on_concierge(format!(
                         "(tmoe) {} {message}",
@@ -561,24 +591,64 @@ fn tui_loop<B: ratatui::backend::Backend>(
                             }
                             break;
                         } else if current_thrust_tx.is_none() {
-                            // **アイドル時の Enter は新規セッションを spawn する**。
-                            // Concierge::translate が "go/pause/stop" のような制御語を Redirect 以外に
-                            // 分類した場合でも、アイドル時は task として扱う方が直感的。
+                            // **アイドル時の Enter は LLM classifier に分類させる**。
+                            // - chat (= 挨拶 / メタ質問 / 雑談) → ConciergeReply で左ペインに返事
+                            // - task (= 実装依頼) → Routed { task: true } を投げて main loop で
+                            //   spawn_session が走る
+                            // 判定は CONCIERGE_SYSTEM プロンプトに任せる。文字列マッチは禁止。
+                            // 失敗時は task に倒れる (= 実装依頼を取り逃がさない安全側)。
                             app.on_concierge(format!("user> {line}"));
-                            let (tx, rx) = ThrustChannel::new();
-                            let _ = tx.send(UserThrust::Go { strength: 1.0 });
-                            spawn_session(
-                                &runtime,
-                                cfg.clone(),
-                                workdir.clone(),
-                                flags.clone(),
-                                line,
-                                rx,
-                                event_tx.clone(),
-                                &mut runtime_handle,
-                                &mut app,
-                            );
-                            current_thrust_tx = Some(tx);
+                            app.on_concierge("(tmoe) thinking…".into());
+                            let cfg_for_classify = cfg.clone();
+                            let event_tx_for_classify = event_tx.clone();
+                            let line_for_classify = line.clone();
+                            runtime.spawn(async move {
+                                let client = match tmoe_llm::OpenAiCompatClient::new(
+                                    cfg_for_classify.llm.clone(),
+                                ) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        let _ = event_tx_for_classify
+                                            .send(RuntimeEvent::Warning(format!(
+                                                "classify_route: build llm client: {e}"
+                                            )))
+                                            .await;
+                                        // LLM すら立てられない場合は task に倒す。
+                                        let _ = event_tx_for_classify
+                                            .send(RuntimeEvent::Routed {
+                                                task: true,
+                                                user_input: line_for_classify,
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                };
+                                let route = classify_route(&client, &line_for_classify).await;
+                                match route {
+                                    Route::Chat { reply } => {
+                                        let _ = event_tx_for_classify
+                                            .send(RuntimeEvent::ConciergeReply(reply))
+                                            .await;
+                                        // chat は session を spawn しないので current_thrust_tx
+                                        // は None のまま。Routed { task: false } を流して main loop
+                                        // 側に「もう何もしなくていい」を伝える (= log だけ)。
+                                        let _ = event_tx_for_classify
+                                            .send(RuntimeEvent::Routed {
+                                                task: false,
+                                                user_input: line_for_classify,
+                                            })
+                                            .await;
+                                    }
+                                    Route::Task => {
+                                        let _ = event_tx_for_classify
+                                            .send(RuntimeEvent::Routed {
+                                                task: true,
+                                                user_input: line_for_classify,
+                                            })
+                                            .await;
+                                    }
+                                }
+                            });
                         } else {
                             // セッション稼動中: 通常の thrust ルートへ。
                             app.on_concierge(format!("user> {line}"));
