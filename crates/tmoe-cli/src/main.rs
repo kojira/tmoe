@@ -574,39 +574,24 @@ fn tui_loop<B: ratatui::backend::Backend>(
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                // 2 段確認の処理:
-                //   1 回目の Esc / Ctrl-C → quit_pending を立てて警告を出すだけ
-                //   pending 状態で Esc / Ctrl-C / 'y' → 本当に終了
-                //   pending 状態で他のキー → cancel して通常処理に戻す
+                // 2 段確認の処理: 状態機械は App::on_quit_key にある。
                 let key_is_quit = matches!(
                     (k.code, k.modifiers),
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _)
                 );
                 let key_is_yes = matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y'));
-                if app.quit_pending {
-                    if key_is_quit || key_is_yes {
+                match app.on_quit_key(key_is_quit, key_is_yes) {
+                    tmoe_cli::app::QuitDecision::Quit => {
                         if let Some(tx) = &current_thrust_tx {
                             let _ = tx.send(UserThrust::Stop);
                         }
                         break;
-                    } else {
-                        // 取り消し。次の Enter 通常処理に進む前に flag を落とし、案内を出す。
-                        app.quit_pending = false;
-                        app.on_concierge("(tmoe) quit canceled.".into());
-                        // このキー自体は呑み込む (取り消しのつもりで押したのに副作用が
-                        // 出ると混乱するため)。Enter / 文字キー含めて全部 swallow。
-                        continue;
                     }
+                    tmoe_cli::app::QuitDecision::Pending => continue,
+                    tmoe_cli::app::QuitDecision::Cancel => continue,
+                    tmoe_cli::app::QuitDecision::Pass => {}
                 }
                 match (k.code, k.modifiers) {
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
-                        // 1 回目: 警告だけ出して flag を立てる。次のキーで本決定。
-                        app.quit_pending = true;
-                        app.on_concierge(
-                            "(tmoe) press Esc / Ctrl-C / y again to quit, any other key to cancel."
-                                .into(),
-                        );
-                    }
                     _ if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         if let Some(thrust) = key_to_thrust(k) {
                             let label = match &thrust {

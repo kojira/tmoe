@@ -20,6 +20,19 @@ use unicode_width::UnicodeWidthChar;
 /// 1 行 ≈ 200 文字想定で、`500 * 4 = 2000` ペイン × 200B ≈ 400KB 程度に収まる。
 pub const LOG_CAP: usize = 500;
 
+/// Esc / Ctrl-C 2 段確認の判定結果。`App::on_quit_key` が返す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuitDecision {
+    /// 通常処理を続けてよい (pending 状態でなく、quit キーでもない)。
+    Pass,
+    /// 1 回目の Esc/Ctrl-C を受けた。警告だけ出して保留。
+    Pending,
+    /// pending 中に他のキーが来たので取消。キー自体は飲み込む。
+    Cancel,
+    /// 確認完了。本当に TUI を抜ける。
+    Quit,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct App {
     pub concierge: Vec<String>,
@@ -115,6 +128,36 @@ impl App {
     }
     pub fn take_input(&mut self) -> String {
         std::mem::take(&mut self.input_buffer)
+    }
+
+    /// Esc / Ctrl-C 2 段確認の状態機械。
+    /// `is_quit_key`: 今押されたキーが Esc または Ctrl-C か。
+    /// `is_yes_key`:  今押されたキーが 'y' / 'Y' (確認用) か。
+    /// 結果に従って main loop が分岐する。`Pending` / `Cancel` の時は警告メッセージも
+    /// concierge ペインに追記しておく (= UX の一貫性のため、状態と表示を一緒に変える)。
+    pub fn on_quit_key(&mut self, is_quit_key: bool, is_yes_key: bool) -> QuitDecision {
+        if self.quit_pending {
+            if is_quit_key || is_yes_key {
+                // 2 回目: 本決定。
+                QuitDecision::Quit
+            } else {
+                // pending 中に他のキー: 取消。キー自体は呑み込む。
+                self.quit_pending = false;
+                self.on_concierge("(tmoe) quit canceled.".into());
+                QuitDecision::Cancel
+            }
+        } else if is_quit_key {
+            // 1 回目: 警告だけ出して保留。
+            self.quit_pending = true;
+            self.on_concierge(
+                "(tmoe) press Esc / Ctrl-C / y again to quit, any other key to cancel."
+                    .into(),
+            );
+            QuitDecision::Pending
+        } else {
+            // 通常入力。状態は据え置きで loop の通常処理へ流す。
+            QuitDecision::Pass
+        }
     }
 
     /// ペイン高さに合わせて末尾 N 行のスライスを返す。新しい行が下に来る。
@@ -300,6 +343,119 @@ mod tests {
         let (x_half_kana, _) = app.cursor_position(area);
         // 半角カナ 2 文字は ASCII 2 文字と同じ 2 セル分。旧実装ならここが 4 になる。
         assert_eq!(x_half_kana, x_ascii);
+    }
+
+    #[test]
+    fn on_quit_key_first_press_is_pending_not_quit() {
+        let mut app = App::new();
+        let d = app.on_quit_key(true, false);
+        assert_eq!(d, QuitDecision::Pending);
+        assert!(app.quit_pending);
+        // 警告が左ペインに足されているはず (= ユーザに「もう 1 回押せ」を見せる)。
+        assert!(app
+            .concierge
+            .iter()
+            .any(|s| s.contains("press Esc") && s.contains("any other key to cancel")));
+    }
+
+    #[test]
+    fn on_quit_key_second_quit_press_decides_quit() {
+        let mut app = App::new();
+        let _ = app.on_quit_key(true, false); // 1 回目
+        let d = app.on_quit_key(true, false); // 2 回目
+        assert_eq!(d, QuitDecision::Quit);
+        // Quit に進む時は flag は据え置きで OK (loop が break するので参照されない)。
+    }
+
+    #[test]
+    fn on_quit_key_pending_then_yes_decides_quit() {
+        // 「Esc 押してから 'y' で確定」フローも quit に到達することを確認。
+        let mut app = App::new();
+        let _ = app.on_quit_key(true, false);
+        let d = app.on_quit_key(false, true);
+        assert_eq!(d, QuitDecision::Quit);
+    }
+
+    #[test]
+    fn on_quit_key_pending_then_other_key_cancels() {
+        let mut app = App::new();
+        let _ = app.on_quit_key(true, false);
+        let d = app.on_quit_key(false, false);
+        assert_eq!(d, QuitDecision::Cancel);
+        assert!(!app.quit_pending, "cancel should clear pending flag");
+        assert!(app
+            .concierge
+            .iter()
+            .any(|s| s.contains("quit canceled")));
+    }
+
+    #[test]
+    fn on_quit_key_idle_pass_through() {
+        // pending 状態でない時に通常キーが来たら何もしない (= Pass で main loop の通常処理へ)。
+        let mut app = App::new();
+        let d = app.on_quit_key(false, false);
+        assert_eq!(d, QuitDecision::Pass);
+        assert!(!app.quit_pending);
+    }
+
+    #[test]
+    fn on_quit_key_cancel_then_quit_requires_two_presses_again() {
+        // 1 回 cancel した後に Esc を押しても即終了せず、また 1 回目扱い (= 1 段確認に戻る)。
+        let mut app = App::new();
+        let _ = app.on_quit_key(true, false); // pending
+        let _ = app.on_quit_key(false, false); // cancel
+        let d = app.on_quit_key(true, false); // また Esc
+        assert_eq!(d, QuitDecision::Pending, "after cancel, Esc should re-arm pending, not quit");
+    }
+
+    /// 入力行とカーソル位置が整合するかの検証ヘルパ。`f.area()` ではなく `area: Rect` を
+    /// 直接渡す形にして、render と cursor_position を同じ Rect で呼ぶ。
+    fn render_and_check_input_row(app: &App, area: Rect) -> (u16, u16, ratatui::buffer::Buffer) {
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.render(area, &mut buf);
+        let (cx, cy) = app.cursor_position(area);
+        (cx, cy, buf)
+    }
+
+    #[test]
+    fn input_row_at_pane_bottom_when_history_short() {
+        // 履歴が pane を埋めない時でも、入力行は pane 内寸の最終 row に固定されているはず。
+        // = cursor_position が指す y 行に input_buffer の文字が描画されている。
+        let mut app = App::new();
+        app.input_buffer = "abc".into();
+        let area = Rect::new(0, 0, 80, 24);
+        let (_cx, cy, buf) = render_and_check_input_row(&app, area);
+        // cy 行の左 pane 内側 (col 1) から "abc" が読めるはず。
+        // ratatui の Buffer は 1 セル 1 文字 (wide char は 2 セルだがここは ASCII)。
+        let line: String = (1..4).map(|x| buf[(x, cy)].symbol().to_string()).collect();
+        assert_eq!(line, "abc", "input row should be at cursor y; got dump '{line}'");
+    }
+
+    #[test]
+    fn input_row_at_pane_bottom_when_history_full() {
+        // 履歴が pane を超えても、入力行は pane 内寸の最終 row に固定されているはず。
+        let mut app = App::new();
+        for i in 0..200 {
+            app.on_concierge(format!("line_{i:03}"));
+        }
+        app.input_buffer = "xyz".into();
+        let area = Rect::new(0, 0, 80, 24);
+        let (_cx, cy, buf) = render_and_check_input_row(&app, area);
+        let line: String = (1..4).map(|x| buf[(x, cy)].symbol().to_string()).collect();
+        assert_eq!(line, "xyz");
+    }
+
+    #[test]
+    fn input_row_at_pane_bottom_with_full_width_chars() {
+        // 全角入力時もカーソル y と描画行が一致する。
+        let mut app = App::new();
+        app.input_buffer = "あい".into();
+        let area = Rect::new(0, 0, 80, 24);
+        let (_cx, cy, buf) = render_and_check_input_row(&app, area);
+        // ratatui は wide char を 1 つの cell に格納し、次の cell は空文字 (placeholder)。
+        // col 1 に "あ", col 3 に "い"。
+        assert_eq!(buf[(1, cy)].symbol(), "あ");
+        assert_eq!(buf[(3, cy)].symbol(), "い");
     }
 
     #[test]
