@@ -310,15 +310,21 @@ fn build_codex_request_body(req: &ChatRequest, model: &str, stream: bool) -> ser
         })
         .collect();
 
-    let mut body = serde_json::json!({
+    // chatgpt.com の `/codex/responses` は GPT-5 reasoning 系モデルだけを対象にしてる関係で、
+    // 古典的なサンプリング系パラメータ (`temperature`, `top_p`, `max_output_tokens`) を全て
+    // 拒否する (Unsupported parameter エラーになる)。opencode の plugin/codex.ts でも
+    // これらを undefined に強制している。tmoe からも送らない。
+    //   - temperature → drop
+    //   - max_output_tokens → drop (出力長はサブスクリプションリミットに任せる)
+    let _ = req.temperature;
+    let _ = req.max_tokens;
+    let body = serde_json::json!({
         "model": model,
         "instructions": instructions,
         "input": input,
         "stream": stream,
         "store": false,
     });
-    if let Some(t) = req.temperature { body["temperature"] = t.into(); }
-    if let Some(m) = req.max_tokens { body["max_output_tokens"] = m.into(); }
     body
 }
 
@@ -440,6 +446,25 @@ async fn backoff(attempt: u32) {
 #[async_trait]
 impl LlmClient for OpenAiCompatClient {
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
+        // Codex (chatgpt.com) は `stream: false` を拒否する ("Stream must be set to true") ので、
+        // 非ストリーミング chat() でも内部的に chat_stream() を回して全トークンを集める。
+        // Supervisor / Observer の vote 経路 (= chat() を呼ぶ) もこれで通る。
+        if self.config.backend == Backend::Codex {
+            use futures::StreamExt;
+            let mut stream = self.chat_stream(req).await?;
+            let mut acc = String::new();
+            let mut finish_reason: Option<String> = None;
+            while let Some(item) = stream.next().await {
+                match item? {
+                    ChatDelta::Token(t) => acc.push_str(&t),
+                    ChatDelta::Done { finish_reason: r } => {
+                        finish_reason = r;
+                        break;
+                    }
+                }
+            }
+            return Ok(ChatResponse { content: acc, finish_reason, usage: None });
+        }
         self.chat_with_retry(req).await
     }
 
@@ -820,7 +845,10 @@ mod tests {
         assert!(body.get("messages").is_none(), "should not have chat-completions `messages`");
         assert_eq!(body["model"], "main");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["max_output_tokens"], 128);
+        // Codex API は max_output_tokens / temperature を拒否するので **送らない**。
+        // req.max_tokens=128 / temperature=0.2 は無視される。
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("temperature").is_none());
         // chatgpt.com の Codex 専用必須フィールド
         assert_eq!(body["instructions"], "be brief");
         assert_eq!(body["store"], false);
