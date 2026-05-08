@@ -269,23 +269,35 @@ impl OpenAiCompatClient {
 
 /// OpenAI Responses API のリクエストボディを組み立てる。Backend::Codex 用。
 ///
-/// 入力 chat/completions 形式 (`messages: [{role, content}]`) を Responses API の
-/// `input: [{role, content: [{type:"input_text", text}]}]` に変換する。
-/// system / developer / user / assistant の各ロールはそのまま渡し、content は単一テキスト
-/// 想定 (= tmoe は今のところ image / file / tool message を構造的に渡していない)。
+/// chatgpt.com の `/codex/responses` エンドポイントは公式 Responses API より厳しい:
+///   - **`instructions` フィールドが必須** (空でも可ではなく、必ず含む)。
+///     tmoe の system メッセージを抜き出してここに連結する。
+///   - **`store: false` が必須** (会話を OpenAI 側に保存しない契約)。
+///   - input は `messages` ではなく role + content blocks の配列。
+///     - user / system / tool は `input_text` content type
+///     - assistant 履歴は `output_text` content type
 fn build_codex_request_body(req: &ChatRequest, model: &str, stream: bool) -> serde_json::Value {
+    // 1) system メッセージを instructions に集約 (複数あれば 2 行空けて連結)。
+    let instructions: String = req
+        .messages
+        .iter()
+        .filter(|m| matches!(m.role, crate::types::Role::System))
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // 2) input には system 以外を残す。system は instructions に行ったので除外。
     let input: Vec<serde_json::Value> = req
         .messages
         .iter()
+        .filter(|m| !matches!(m.role, crate::types::Role::System))
         .map(|m| {
             let role = match m.role {
-                crate::types::Role::System => "system",
+                crate::types::Role::System => unreachable!(),
                 crate::types::Role::User => "user",
                 crate::types::Role::Assistant => "assistant",
                 crate::types::Role::Tool => "tool",
             };
-            // assistant のメッセージは output_text、それ以外は input_text を使う。
-            // Responses API は user/system/developer 側を input_*、assistant 履歴は output_* で受ける。
             let content_type = if matches!(m.role, crate::types::Role::Assistant) {
                 "output_text"
             } else {
@@ -300,8 +312,10 @@ fn build_codex_request_body(req: &ChatRequest, model: &str, stream: bool) -> ser
 
     let mut body = serde_json::json!({
         "model": model,
+        "instructions": instructions,
         "input": input,
         "stream": stream,
+        "store": false,
     });
     if let Some(t) = req.temperature { body["temperature"] = t.into(); }
     if let Some(m) = req.max_tokens { body["max_output_tokens"] = m.into(); }
@@ -787,8 +801,9 @@ mod tests {
         assert_eq!(url.as_str(), "https://chatgpt.com/backend-api/codex/responses");
     }
 
-    /// Backend::Codex のリクエストボディは `messages` ではなく Responses API 形式の
-    /// `input` 配列を持つ。各メッセージは role + content[type="input_text"|"output_text"] で表現。
+    /// Backend::Codex のリクエストボディは Responses API 形式 + chatgpt.com 固有の
+    /// 必須フィールド (instructions / store=false) を持つ。system メッセージは
+    /// instructions に集約され、input には残らない。
     #[test]
     fn build_request_body_for_codex_emits_responses_api_format() {
         let c = OpenAiCompatClient::new(cfg(Backend::Codex, None)).unwrap();
@@ -806,14 +821,38 @@ mod tests {
         assert_eq!(body["model"], "main");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 128);
+        // chatgpt.com の Codex 専用必須フィールド
+        assert_eq!(body["instructions"], "be brief");
+        assert_eq!(body["store"], false);
+        // input には system 以外だけ残る
         let input = body["input"].as_array().expect("input must be array");
-        assert_eq!(input.len(), 2);
-        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"][0]["type"], "input_text");
-        assert_eq!(input[0]["content"][0]["text"], "be brief");
-        assert_eq!(input[1]["role"], "user");
-        assert_eq!(input[1]["content"][0]["type"], "input_text");
-        assert_eq!(input[1]["content"][0]["text"], "hello");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
+    }
+
+    /// 複数の system メッセージは instructions に 2 行空けて連結される。Worker が複数の
+    /// system プロンプトを重ねてくる将来パターンに耐える。
+    #[test]
+    fn build_request_body_for_codex_concatenates_multiple_system_messages() {
+        let c = OpenAiCompatClient::new(cfg(Backend::Codex, None)).unwrap();
+        let req = ChatRequest {
+            messages: vec![
+                ChatMessage::system("you are tmoe Worker"),
+                ChatMessage::system("output only ```json blocks then DONE"),
+                ChatMessage::user("task"),
+            ],
+            ..Default::default()
+        };
+        let body = c.build_request_body(&req, false);
+        assert_eq!(
+            body["instructions"],
+            "you are tmoe Worker\n\noutput only ```json blocks then DONE"
+        );
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
     }
 
     /// Responses API ストリームの `response.output_text.delta` が ChatDelta::Token に
