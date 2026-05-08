@@ -159,10 +159,18 @@ impl Widget for &App {
         let warn_n = pane_h(warn_pane);
         let feat_n = pane_h(bottom_tree);
 
-        // Concierge ペイン: 履歴 (末尾 N-2 行) + 入力プロンプト 2 行。
+        // Concierge ペイン: 上 N-2 行が履歴、下 2 行は固定で "> " + input_buffer。
+        // 履歴が pane を埋めない時は **空行で padding** することで、input 行を必ず
+        // pane の内寸最終 row に固定する。これで `cursor_position` が返す y
+        // (= pane.y + height - 2) と input 行が常に一致し、macOS Terminal の IME
+        // pre-edit が「履歴の上には > プロンプトだけ、ずっと下に未確定文字」のように
+        // 分離して描かれる症状を防ぐ。
         let conc_keep = conc_n.saturating_sub(2);
         let conc_visible = App::tail(&self.concierge, conc_keep);
         let mut conc_lines: Vec<Line> = conc_visible.iter().map(|s| Line::from(s.as_str())).collect();
+        while conc_lines.len() < conc_keep {
+            conc_lines.push(Line::from(""));
+        }
         conc_lines.push(Line::from("> "));
         conc_lines.push(Line::from(self.input_buffer.as_str()));
         Paragraph::new(conc_lines)

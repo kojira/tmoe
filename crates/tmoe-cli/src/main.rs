@@ -258,11 +258,11 @@ async fn main() -> Result<()> {
     };
     match effective_task {
         Some(task) if args.headless => run_headless(task, cfg, workdir, flags).await,
-        Some(task) => run_tui(Some(task), cfg, workdir, flags),
+        Some(task) => run_tui(Some(task), cfg, workdir, flags).await,
         None if args.headless => {
             anyhow::bail!("--headless requires a task argument: tmoe --headless \"<task>\"")
         }
-        None => run_tui(None, cfg, workdir, flags),
+        None => run_tui(None, cfg, workdir, flags).await,
     }
 }
 
@@ -433,7 +433,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn run_tui(
+async fn run_tui(
     initial_task: Option<String>,
     cfg: config::Config,
     workdir: PathBuf,
@@ -454,7 +454,14 @@ fn run_tui(
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    tui_loop(&mut terminal, initial_task, cfg, workdir, flags, log_path)
+    // tui_loop は同期 loop (terminal.draw + event::poll)。`#[tokio::main]` の async
+    // context にいるので、内部で別 runtime を立てて drop すると tokio が
+    // 「Cannot drop a runtime in a context where blocking is not allowed」で panic する。
+    // block_in_place で外側 runtime に blocking 許可をもらい、Handle::current() を渡して
+    // task spawn は外側 runtime の上で回す。
+    tokio::task::block_in_place(|| {
+        tui_loop(&mut terminal, initial_task, cfg, workdir, flags, log_path)
+    })
     // _guard の Drop で disable_raw_mode + LeaveAlternateScreen + Show を実行。
 }
 
@@ -466,10 +473,9 @@ fn tui_loop<B: ratatui::backend::Backend>(
     flags: RunFlags,
     log_path: PathBuf,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime")?;
+    // 外側 `#[tokio::main]` runtime の handle を借りる。内部で別 runtime を立てると
+    // drop 時に async context で blocking ができず panic するので絶対やらない。
+    let handle = tokio::runtime::Handle::current();
     let (event_tx, mut event_rx) = mpsc::channel::<RuntimeEvent>(64);
 
     let mut app = App::new();
@@ -489,7 +495,7 @@ fn tui_loop<B: ratatui::backend::Backend>(
         // 後から Pause / Stop / Redirect すれば変更できる。
         let _ = tx.send(UserThrust::Go { strength: 1.0 });
         spawn_session(
-            &runtime,
+            &handle,
             cfg.clone(),
             workdir.clone(),
             flags.clone(),
@@ -520,7 +526,7 @@ fn tui_loop<B: ratatui::backend::Backend>(
                             let (tx, rx) = ThrustChannel::new();
                             let _ = tx.send(UserThrust::Go { strength: 1.0 });
                             spawn_session(
-                                &runtime,
+                                &handle,
                                 cfg.clone(),
                                 workdir.clone(),
                                 flags.clone(),
@@ -658,7 +664,7 @@ fn tui_loop<B: ratatui::backend::Backend>(
                             let cfg_for_classify = cfg.clone();
                             let event_tx_for_classify = event_tx.clone();
                             let line_for_classify = line.clone();
-                            runtime.spawn(async move {
+                            handle.spawn(async move {
                                 let client = match tmoe_llm::OpenAiCompatClient::new(
                                     cfg_for_classify.llm.clone(),
                                 ) {
@@ -728,15 +734,20 @@ fn tui_loop<B: ratatui::backend::Backend>(
         }
     }
 
+    // TUI を抜ける時に裏で走ってる feature task を中断。
+    // ここで block_on(h.await) で待ちたいところだが、外側 `#[tokio::main]` runtime の
+    // 中にいるので nested block_on は禁止。Stop シグナルは既に送ってあるので、
+    // abort + drop で task を detach する (worktree の clean up は次回起動時に検知)。
     if let Some(h) = runtime_handle {
-        let _ = runtime.block_on(async { h.await });
+        h.abort();
+        drop(h);
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_session(
-    runtime: &tokio::runtime::Runtime,
+    handle: &tokio::runtime::Handle,
     cfg: config::Config,
     workdir: PathBuf,
     flags: RunFlags,
@@ -746,7 +757,7 @@ fn spawn_session(
     runtime_handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
     app: &mut App,
 ) {
-    *runtime_handle = Some(runtime.spawn(async move {
+    *runtime_handle = Some(handle.spawn(async move {
         let mut opts = RunOptions::new(task, workdir);
         opts.use_worktree = flags.use_worktree;
         opts.cleanup_worktree = flags.cleanup_worktree;
