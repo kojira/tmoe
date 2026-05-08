@@ -64,18 +64,21 @@ impl App {
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(middle);
         let concierge_pane = cols[0];
-        // Concierge ペインの中、input_buffer の末尾位置:
-        //   x = pane.x + 1 (left border) + display width of input_buffer
-        //   y = pane.y + pane.height - 2 (bottom border above)
+        // Concierge ペインの中、入力 caret 位置:
+        //   x = pane.x + 1 (left border) + 2 ("> " prompt) + display width of input_buffer
+        //   y = pane.y + pane.height - 2 (= 内寸の最終 row。入力行はここに固定)
         // unicode-width で half-width / full-width / 結合文字を正しく扱う。
-        // 0x1100 比較の旧実装は半角カタカナを 2 列と数えてしまい、IME pre-edit が
-        // 右の Trio ペインのボーダーを上書きしていた。
+        const PROMPT_WIDTH: u16 = 2; // "> "
         let input_visible_width: u16 = self
             .input_buffer
             .chars()
             .map(|c| c.width().unwrap_or(0) as u16)
             .sum();
-        let x = concierge_pane.x.saturating_add(1).saturating_add(input_visible_width);
+        let x = concierge_pane
+            .x
+            .saturating_add(1)
+            .saturating_add(PROMPT_WIDTH)
+            .saturating_add(input_visible_width);
         let y = concierge_pane
             .y
             .saturating_add(concierge_pane.height.saturating_sub(2));
@@ -202,20 +205,17 @@ impl Widget for &App {
         let warn_n = pane_h(warn_pane);
         let feat_n = pane_h(bottom_tree);
 
-        // Concierge ペイン: 上 N-2 行が履歴、下 2 行は固定で "> " + input_buffer。
-        // 履歴が pane を埋めない時は **空行で padding** することで、input 行を必ず
-        // pane の内寸最終 row に固定する。これで `cursor_position` が返す y
-        // (= pane.y + height - 2) と input 行が常に一致し、macOS Terminal の IME
-        // pre-edit が「履歴の上には > プロンプトだけ、ずっと下に未確定文字」のように
-        // 分離して描かれる症状を防ぐ。
-        let conc_keep = conc_n.saturating_sub(2);
+        // Concierge ペイン: 上 N-1 行が履歴 (空行で padding)、下 1 行は固定で "> input_buffer"。
+        // `>` プロンプトと入力 / IME pre-edit を **同じ row に書く** ことで、ターミナル
+        // アプリとして自然な見た目にする。cursor_position も同じ row を指すので、
+        // pre-edit が `>` 行と分離して描かれない。
+        let conc_keep = conc_n.saturating_sub(1);
         let conc_visible = App::tail(&self.concierge, conc_keep);
         let mut conc_lines: Vec<Line> = conc_visible.iter().map(|s| Line::from(s.as_str())).collect();
         while conc_lines.len() < conc_keep {
             conc_lines.push(Line::from(""));
         }
-        conc_lines.push(Line::from("> "));
-        conc_lines.push(Line::from(self.input_buffer.as_str()));
+        conc_lines.push(Line::from(format!("> {}", self.input_buffer)));
         Paragraph::new(conc_lines)
             .block(Block::default().borders(Borders::ALL).title("Concierge — Z 軸推進入力"))
             .render(concierge_pane, buf);
@@ -329,20 +329,30 @@ mod tests {
         // 日本語 (full-width) 2 文字は 4 セル分。半角 ASCII 2 文字は 2 セル分。
         // 旧実装は半角カタカナ ｱ (U+FF71) を 2 セルと誤算していたが、unicode-width 経由で
         // 正しく 1 セルになるので、IME pre-edit が右ペインを侵食しない。
+        // (cursor x には "> " 分の 2 がベースで足されるが、相対差は input 幅だけで決まる)。
         let mut app = App::new();
         let area = Rect::new(0, 0, 80, 24);
         app.input_buffer = "ab".into();
         let (x_ascii, _) = app.cursor_position(area);
         app.input_buffer = "あい".into();
         let (x_full, _) = app.cursor_position(area);
-        // ASCII 2 文字 = pane.x + 1 + 2 = 3
-        // 全角 2 文字 = pane.x + 1 + 4 = 5
+        // ASCII 2 文字 / 全角 2 文字の差は (4 - 2) = 2 セル。
         assert_eq!(x_full.saturating_sub(x_ascii), 2);
 
         app.input_buffer = "ｱｲ".into();
         let (x_half_kana, _) = app.cursor_position(area);
         // 半角カナ 2 文字は ASCII 2 文字と同じ 2 セル分。旧実装ならここが 4 になる。
         assert_eq!(x_half_kana, x_ascii);
+    }
+
+    #[test]
+    fn cursor_position_includes_prompt_offset() {
+        // input_buffer が空でも、`> ` プロンプト分 (= 2 cell) だけ pane 左端から右にずれる。
+        let app = App::new();
+        let area = Rect::new(0, 0, 80, 24);
+        let (x, _) = app.cursor_position(area);
+        // pane.x = 0, +1 (left border) +2 ("> ") = 3
+        assert_eq!(x, 3);
     }
 
     #[test]
@@ -420,15 +430,14 @@ mod tests {
     #[test]
     fn input_row_at_pane_bottom_when_history_short() {
         // 履歴が pane を埋めない時でも、入力行は pane 内寸の最終 row に固定されているはず。
-        // = cursor_position が指す y 行に input_buffer の文字が描画されている。
+        // = cursor_position が指す y 行に "> input_buffer" が同一行で描画されている。
         let mut app = App::new();
         app.input_buffer = "abc".into();
         let area = Rect::new(0, 0, 80, 24);
         let (_cx, cy, buf) = render_and_check_input_row(&app, area);
-        // cy 行の左 pane 内側 (col 1) から "abc" が読めるはず。
-        // ratatui の Buffer は 1 セル 1 文字 (wide char は 2 セルだがここは ASCII)。
-        let line: String = (1..4).map(|x| buf[(x, cy)].symbol().to_string()).collect();
-        assert_eq!(line, "abc", "input row should be at cursor y; got dump '{line}'");
+        // cy 行の col 1 から "> abc" が読めるはず (border 1 + "> " 2 + "abc")。
+        let line: String = (1..6).map(|x| buf[(x, cy)].symbol().to_string()).collect();
+        assert_eq!(line, "> abc", "input row should be at cursor y; got dump '{line}'");
     }
 
     #[test]
@@ -441,21 +450,38 @@ mod tests {
         app.input_buffer = "xyz".into();
         let area = Rect::new(0, 0, 80, 24);
         let (_cx, cy, buf) = render_and_check_input_row(&app, area);
-        let line: String = (1..4).map(|x| buf[(x, cy)].symbol().to_string()).collect();
-        assert_eq!(line, "xyz");
+        let line: String = (1..6).map(|x| buf[(x, cy)].symbol().to_string()).collect();
+        assert_eq!(line, "> xyz");
     }
 
     #[test]
     fn input_row_at_pane_bottom_with_full_width_chars() {
-        // 全角入力時もカーソル y と描画行が一致する。
+        // 全角入力時もカーソル y と描画行が一致する。"> " の後ろに "あい" が入る。
         let mut app = App::new();
         app.input_buffer = "あい".into();
         let area = Rect::new(0, 0, 80, 24);
         let (_cx, cy, buf) = render_and_check_input_row(&app, area);
-        // ratatui は wide char を 1 つの cell に格納し、次の cell は空文字 (placeholder)。
-        // col 1 に "あ", col 3 に "い"。
-        assert_eq!(buf[(1, cy)].symbol(), "あ");
-        assert_eq!(buf[(3, cy)].symbol(), "い");
+        // col 1 = ">", col 2 = " ", col 3 = "あ", col 5 = "い"
+        assert_eq!(buf[(1, cy)].symbol(), ">");
+        assert_eq!(buf[(3, cy)].symbol(), "あ");
+        assert_eq!(buf[(5, cy)].symbol(), "い");
+    }
+
+    #[test]
+    fn cursor_y_matches_input_row_y() {
+        // cursor_position が返す y と、Paragraph で描画された "> " の y が一致することを
+        // ピクセル単位で確認する。これがズレると IME pre-edit が分離する。
+        let mut app = App::new();
+        app.input_buffer = "abc".into();
+        let area = Rect::new(0, 0, 80, 24);
+        let (cx, cy, buf) = render_and_check_input_row(&app, area);
+        // 描画された ">" の row を Buffer から逆算。
+        let drawn_y = (0..area.height)
+            .find(|&y| buf[(1, y)].symbol() == ">")
+            .expect("'>' should be drawn somewhere");
+        assert_eq!(cy, drawn_y, "cursor y must match drawn '>' row");
+        // x も "> abc" の直後 (= "> "(2) + "abc"(3) + border(1) = 6)
+        assert_eq!(cx, 6);
     }
 
     #[test]
