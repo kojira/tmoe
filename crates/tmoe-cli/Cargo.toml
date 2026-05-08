@@ -33,6 +33,7 @@ url.workspace = true
 git2.workspace = true
 async-trait.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

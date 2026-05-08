@@ -10,6 +10,7 @@ use tmoe_cli::config;
 use tmoe_cli::runtime::{
     doctor, history_list, history_show, merge_feature, run_feature, RunOptions, RuntimeEvent,
 };
+use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -410,6 +411,28 @@ struct RunFlags {
     resume_feature_id: Option<String>,
 }
 
+/// TUI 入退出のターミナル状態を保証する RAII guard。
+/// `tui_loop` が `?` で早期 return しても panic しても drop で必ず復帰させ、
+/// 「正常終了したのに ANSI 残骸でターミナルが壊れる」を物理的に防ぐ。
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        Ok(TerminalGuard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // どれか失敗しても残りは続行する。最低限 raw mode は外して alt screen は抜ける。
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    }
+}
+
 fn run_tui(
     initial_task: Option<String>,
     cfg: config::Config,
@@ -417,15 +440,22 @@ fn run_tui(
     flags: RunFlags,
 ) -> Result<()> {
     let log_path = init_tracing_file(&cfg.history_root);
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+
+    // panic 時でも terminal を必ず復帰させるため、既存 hook を保存してから
+    // 復帰処理を挟むカスタム hook に差し替える。Drop ガードと併用することで
+    // 「`?` で早期 return」「panic」「正常 break」の 3 経路すべてを救う。
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        prev_hook(info);
+    }));
+
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let res = tui_loop(&mut terminal, initial_task, cfg, workdir, flags, log_path);
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    res
+    tui_loop(&mut terminal, initial_task, cfg, workdir, flags, log_path)
+    // _guard の Drop で disable_raw_mode + LeaveAlternateScreen + Show を実行。
 }
 
 fn tui_loop<B: ratatui::backend::Backend>(
@@ -538,12 +568,38 @@ fn tui_loop<B: ratatui::backend::Backend>(
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                match (k.code, k.modifiers) {
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+                // 2 段確認の処理:
+                //   1 回目の Esc / Ctrl-C → quit_pending を立てて警告を出すだけ
+                //   pending 状態で Esc / Ctrl-C / 'y' → 本当に終了
+                //   pending 状態で他のキー → cancel して通常処理に戻す
+                let key_is_quit = matches!(
+                    (k.code, k.modifiers),
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _)
+                );
+                let key_is_yes = matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+                if app.quit_pending {
+                    if key_is_quit || key_is_yes {
                         if let Some(tx) = &current_thrust_tx {
                             let _ = tx.send(UserThrust::Stop);
                         }
                         break;
+                    } else {
+                        // 取り消し。次の Enter 通常処理に進む前に flag を落とし、案内を出す。
+                        app.quit_pending = false;
+                        app.on_concierge("(tmoe) quit canceled.".into());
+                        // このキー自体は呑み込む (取り消しのつもりで押したのに副作用が
+                        // 出ると混乱するため)。Enter / 文字キー含めて全部 swallow。
+                        continue;
+                    }
+                }
+                match (k.code, k.modifiers) {
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+                        // 1 回目: 警告だけ出して flag を立てる。次のキーで本決定。
+                        app.quit_pending = true;
+                        app.on_concierge(
+                            "(tmoe) press Esc / Ctrl-C / y again to quit, any other key to cancel."
+                                .into(),
+                        );
                     }
                     _ if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         if let Some(thrust) = key_to_thrust(k) {

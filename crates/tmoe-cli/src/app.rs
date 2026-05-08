@@ -14,6 +14,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Widget};
+use unicode_width::UnicodeWidthChar;
 
 /// TUI ペインに保持するログの最大行数。これを超えると古い行が破棄される (= スクロールバック上限)。
 /// 1 行 ≈ 200 文字想定で、`500 * 4 = 2000` ペイン × 200B ≈ 400KB 程度に収まる。
@@ -29,6 +30,9 @@ pub struct App {
     pub status: String,
     /// 各ログの上限。テスト用に上書き可能。
     pub log_cap: usize,
+    /// Esc / Ctrl-C を 1 回押した状態。次のキーが Esc / Ctrl-C / y なら本当に終了、
+    /// それ以外なら取り消し。誤操作で session 中断を防ぐための 2 段確認。
+    pub quit_pending: bool,
 }
 
 impl App {
@@ -50,11 +54,14 @@ impl App {
         // Concierge ペインの中、input_buffer の末尾位置:
         //   x = pane.x + 1 (left border) + display width of input_buffer
         //   y = pane.y + pane.height - 2 (bottom border above)
-        let input_visible_width = self.input_buffer.chars().fold(0u16, |acc, c| {
-            // CJK 全角文字は 2 列、それ以外は 1 列で概算 (unicode-width の正確版を入れない代わりの近似)。
-            let w = if c as u32 >= 0x1100 { 2 } else { 1 };
-            acc.saturating_add(w)
-        });
+        // unicode-width で half-width / full-width / 結合文字を正しく扱う。
+        // 0x1100 比較の旧実装は半角カタカナを 2 列と数えてしまい、IME pre-edit が
+        // 右の Trio ペインのボーダーを上書きしていた。
+        let input_visible_width: u16 = self
+            .input_buffer
+            .chars()
+            .map(|c| c.width().unwrap_or(0) as u16)
+            .sum();
         let x = concierge_pane.x.saturating_add(1).saturating_add(input_visible_width);
         let y = concierge_pane
             .y
@@ -264,5 +271,39 @@ mod tests {
         let taken = app.take_input();
         assert_eq!(taken, "hell");
         assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn cursor_position_uses_unicode_width_for_full_width_chars() {
+        // 日本語 (full-width) 2 文字は 4 セル分。半角 ASCII 2 文字は 2 セル分。
+        // 旧実装は半角カタカナ ｱ (U+FF71) を 2 セルと誤算していたが、unicode-width 経由で
+        // 正しく 1 セルになるので、IME pre-edit が右ペインを侵食しない。
+        let mut app = App::new();
+        let area = Rect::new(0, 0, 80, 24);
+        app.input_buffer = "ab".into();
+        let (x_ascii, _) = app.cursor_position(area);
+        app.input_buffer = "あい".into();
+        let (x_full, _) = app.cursor_position(area);
+        // ASCII 2 文字 = pane.x + 1 + 2 = 3
+        // 全角 2 文字 = pane.x + 1 + 4 = 5
+        assert_eq!(x_full.saturating_sub(x_ascii), 2);
+
+        app.input_buffer = "ｱｲ".into();
+        let (x_half_kana, _) = app.cursor_position(area);
+        // 半角カナ 2 文字は ASCII 2 文字と同じ 2 セル分。旧実装ならここが 4 になる。
+        assert_eq!(x_half_kana, x_ascii);
+    }
+
+    #[test]
+    fn cursor_position_clamps_inside_pane_when_input_overflows() {
+        // 入力幅がペイン幅を超えても、cursor は右端の手前に張り付く (= pre-edit が
+        // 右ペインのボーダーに食い込まない最後の防壁)。
+        let mut app = App::new();
+        let area = Rect::new(0, 0, 80, 24);
+        app.input_buffer = "あ".repeat(200); // 400 セル相当
+        let (x, _) = app.cursor_position(area);
+        // 左 pane は area の 45% なので width ≈ 36。x は pane.x + (width - 2) 以下に収まる。
+        let pane_right_max = 36u16; // 80 * 0.45 - 2 ≈ 34, 余裕で含む上限
+        assert!(x <= pane_right_max, "cursor x={x} should be clamped under {pane_right_max}");
     }
 }
