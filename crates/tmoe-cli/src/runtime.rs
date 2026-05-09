@@ -392,9 +392,12 @@ pub async fn run_feature(
         std::sync::Arc::new(cb) as DeltaSink
     });
 
-    // Worker が呼んだツールの実行結果を TrioLog に流す sink。複数行 stdout は 1 行に
-    // 圧縮せずそのまま流したいので、改行で分割して 1 行ずつ送る (右ペインの List は
-    // 1 行 1 entry なので長文は折り返さず切れる代わりに、行ごとに見える)。
+    // Worker が呼んだツールの実行結果を **Concierge** に流す sink。
+    // Trio ペインは Worker の token streaming や vote (= 内部状態) を見せる場所。
+    // 一方、tool が実行されて何が返ってきたかは「ユーザに対する答え」なので、
+    // チャット履歴の一部として Concierge ペインに残すのが UX として自然。
+    // 複数行 stdout は改行で分割して 1 行ずつ送る (Concierge は wrap 有効なので
+    // 長文も読める)。
     let tool_output_sink: Option<DeltaSink> = event_tx.as_ref().map(|tx| {
         let tx = tx.clone();
         let cb = move |body: String| {
@@ -402,7 +405,7 @@ pub async fn run_feature(
                 if line.trim().is_empty() {
                     continue;
                 }
-                let _ = tx.try_send(RuntimeEvent::TrioLog(line.to_string()));
+                let _ = tx.try_send(RuntimeEvent::ConciergeReply(line.to_string()));
             }
         };
         std::sync::Arc::new(cb) as DeltaSink
