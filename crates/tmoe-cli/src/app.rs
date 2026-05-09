@@ -13,7 +13,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 /// TUI ペインに保持するログの最大行数。これを超えると古い行が破棄される (= スクロールバック上限)。
@@ -77,17 +77,20 @@ impl App {
 
     /// 全体 area からレイアウトを切って、入力行 (画面最下 1 行) の Rect を返す。
     /// `cursor_position` と `render` で同じ計算を使うために共通化。
+    /// 制約配列は `render` のものと一致させる。
     fn input_bar_rect(area: Rect) -> Rect {
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(5),    // middle (concierge / trio / observer)
+                Constraint::Min(5),    // concierge
+                Constraint::Length(8), // trio
+                Constraint::Length(4), // observer warnings
                 Constraint::Length(7), // features
-                Constraint::Length(1), // status (border 無し)
-                Constraint::Length(1), // input bar (border 無し、画面最下端)
+                Constraint::Length(1), // status
+                Constraint::Length(1), // input bar
             ])
             .split(area);
-        outer[3]
+        outer[5]
     }
 
     pub fn new() -> Self {
@@ -177,57 +180,49 @@ impl App {
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // 縦 4 段:
-        //   ① middle (Concierge + Trio + Observer の 3 ペイン)
-        //   ② features (枠あり、~7 行)
-        //   ③ status (border 無し 1 行)
-        //   ④ input bar (border 無し 1 行、画面最下端)
-        // 入力欄を最下端に独立させる狙い: IME pre-edit が右ペインの border / 内側に
-        // 干渉するのを物理的に防ぐ (右ペインと同じ y 行に入力が来ないので衝突しない)。
+        // 縦並び (横分割なし) に変更。横分割は wrap 計算が複雑になり、長文の右端で
+        // 文字が切れる症状が出やすいので避ける。代わりに各ペインを画面全幅で縦に積む。
+        //   ① Concierge (Min, Paragraph::wrap で自動改行)
+        //   ② Trio (固定 8 行)
+        //   ③ Observer warnings (固定 4 行)
+        //   ④ Features (固定 7 行)
+        //   ⑤ status (border 無し 1 行)
+        //   ⑥ input bar (border 無し 1 行)
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
+                Constraint::Length(8),
+                Constraint::Length(4),
                 Constraint::Length(7),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
             .split(area);
-        let middle = outer[0];
-        let bottom_tree = outer[1];
-        let status_bar = outer[2];
-        let input_bar = outer[3];
+        let concierge_pane = outer[0];
+        let trio_pane = outer[1];
+        let warn_pane = outer[2];
+        let bottom_tree = outer[3];
+        let status_bar = outer[4];
+        let input_bar = outer[5];
 
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(middle);
-
-        let concierge_pane = cols[0];
-        let right = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(cols[1]);
-        let trio_pane = right[0];
-        let warn_pane = right[1];
-
-        // 各ペインに収まる末尾 N 行だけ render する (= スクロールバック: 新しい行が見える)。
-        // pane height はボーダーを除いた内寄り高さに依存するので、保守的に
-        // `pane.height - 2` をターゲットにする (タイトル + 下線で 2 行消費)。
         let pane_h = |area: Rect| area.height.saturating_sub(2) as usize;
-        let conc_n = pane_h(concierge_pane);
         let trio_n = pane_h(trio_pane);
         let warn_n = pane_h(warn_pane);
         let feat_n = pane_h(bottom_tree);
 
-        // Concierge ペイン: 入力 UI を持たず、ログ末尾 N 行のみ表示。
-        let conc_visible = App::tail(&self.concierge, conc_n);
+        // Concierge ペイン: 全幅で wrap 有効。長文ログがペイン幅を超えても改行されて
+        // 右端で切れない。tail は wrap 後の行数を考慮できないので、保守的に多めに渡す
+        // (Paragraph 側がペイン高で自動カット)。
+        let conc_keep = (concierge_pane.height as usize).saturating_sub(2).max(1);
+        let conc_visible = App::tail(&self.concierge, conc_keep);
         let conc_lines: Vec<Line> = conc_visible.iter().map(|s| Line::from(s.as_str())).collect();
         Paragraph::new(conc_lines)
+            .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("Concierge"))
             .render(concierge_pane, buf);
 
-        // Trio ライブログ (末尾 N 行)。
+        // Trio ライブログ (末尾 N 行)。横幅は画面全幅。長行は List がそのまま切る。
         let trio_visible = App::tail(&self.trio_log, trio_n);
         let trio_items: Vec<ListItem> =
             trio_visible.iter().map(|s| ListItem::new(s.as_str())).collect();
@@ -255,9 +250,7 @@ impl Widget for &App {
             .style(Style::default().add_modifier(Modifier::BOLD))
             .render(status_bar, buf);
 
-        // 入力欄 (border 無し 1 行、画面最下端)。`> ` プロンプトの右に input_buffer を直書き。
-        // border が無いので IME pre-edit がこの行で右にはみ出ても、隣接ペインの border 文字を
-        // 上書きしない (= 右ペインの中段にある縦線位置とは y がずれるので衝突しない)。
+        // 入力欄 (border 無し 1 行、画面最下端)。
         Paragraph::new(format!("> {}", self.input_buffer))
             .render(input_bar, buf);
     }
@@ -502,6 +495,23 @@ mod tests {
         assert_eq!(cy, drawn_y);
         // x = "> "(2) + "abc"(3) = 5
         assert_eq!(cx, 5);
+    }
+
+    #[test]
+    fn long_concierge_line_wraps_instead_of_being_truncated() {
+        // 横分割をやめて wrap を有効にしたので、ペイン幅を超える長文が右端で切れず
+        // 次の行に折り返されるはず。
+        let mut app = App::new();
+        let long_line = "(tmoe) ".to_string() + &"あ".repeat(60); // 7 + 120 = 127 cells
+        app.on_concierge(long_line);
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.render(area, &mut buf);
+        // ペイン幅 80 - 2 (border) = 78 cells に "あ" 60 個 (= 120 cells) は収まらない。
+        // wrap が効いていれば、Concierge ペイン内寸の 2 行目以降にも "あ" が描かれる。
+        // = 内寸 row 1 (= y=2: top border y=0, 1 行目 y=1, 2 行目 y=2)
+        let row2: String = (1..79).map(|x| buf[(x, 2u16)].symbol().to_string()).collect();
+        assert!(row2.contains("あ"), "wrapped line should appear on the second row, got: {row2:?}");
     }
 
     #[test]
