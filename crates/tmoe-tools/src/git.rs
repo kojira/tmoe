@@ -145,6 +145,17 @@ pub fn cleanup_worktree(handle: WorktreeHandle) -> GitResult<()> {
     Ok(())
 }
 
+/// feature branch を削除する。空コミット相当 (= 何も commit しなかった) の後に呼ぶと、
+/// `tmoe/feature/<id>` の宙に浮いた ref が `git branch` を汚さない。
+/// branch が見つからない時は no-op として扱う。
+pub fn delete_feature_branch(handle: &WorktreeHandle) -> GitResult<()> {
+    let repo = Repository::open(&handle.repo_path)?;
+    if let Ok(mut branch) = repo.find_branch(&handle.branch_name, git2::BranchType::Local) {
+        branch.delete()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

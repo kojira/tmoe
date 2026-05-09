@@ -134,11 +134,13 @@ impl Trio {
         thrust_rx: &mut ThrustReceiver,
         views: Option<&dyn ViewProvider>,
     ) -> anyhow::Result<TrioOutcome> {
-        self.run_step_full(user_messages, tools, thrust_rx, views, None).await
+        self.run_step_full(user_messages, tools, thrust_rx, views, None, None).await
     }
 
     /// streaming 対応版: Worker の応答 token を `on_worker_delta` に逐次流す。
     /// Supervisor/Observer の vote は短いので streaming しない (= chat の 1 発呼出し)。
+    /// `on_tool_output` を渡すと、Worker が呼んだ各 tool の実行結果を整形済み文字列で流す
+    /// (= UI のログペインに「tool[run_cmd]: ...」のように出すための後段フック)。
     pub async fn run_step_streaming(
         &self,
         user_messages: &[ChatMessage],
@@ -146,8 +148,9 @@ impl Trio {
         thrust_rx: &mut ThrustReceiver,
         views: Option<&dyn ViewProvider>,
         on_worker_delta: DeltaSink,
+        on_tool_output: Option<DeltaSink>,
     ) -> anyhow::Result<TrioOutcome> {
-        self.run_step_full(user_messages, tools, thrust_rx, views, Some(on_worker_delta)).await
+        self.run_step_full(user_messages, tools, thrust_rx, views, Some(on_worker_delta), on_tool_output).await
     }
 
     async fn run_step_full(
@@ -157,6 +160,7 @@ impl Trio {
         thrust_rx: &mut ThrustReceiver,
         views: Option<&dyn ViewProvider>,
         on_worker_delta: Option<DeltaSink>,
+        on_tool_output: Option<DeltaSink>,
     ) -> anyhow::Result<TrioOutcome> {
         let mut steps = 0u32;
         let mut last_proposal = Proposal::empty();
@@ -185,6 +189,24 @@ impl Trio {
             )
             .await?;
             let proposal = pm.proposal;
+            // 各 tool 実行結果を sink に流す (= ユーザに見える形でログペインへ)。
+            // tool_outputs は proposal.tool_calls と同じ順序で並ぶ前提。
+            if let Some(sink) = on_tool_output.as_ref() {
+                for (call, result) in proposal.tool_calls.iter().zip(pm.tool_outputs.iter()) {
+                    let body = match result {
+                        Ok(out) => {
+                            let trimmed = out.stdout.trim_end_matches('\n');
+                            if trimmed.is_empty() {
+                                format!("tool[{}]: (no output)", call.name)
+                            } else {
+                                format!("tool[{}]: {}", call.name, trimmed)
+                            }
+                        }
+                        Err(e) => format!("tool[{}] failed: {}", call.name, e),
+                    };
+                    sink(body);
+                }
+            }
             last_proposal = proposal.clone();
 
             // 2) Supervisor / Observer / Worker 自己評価で 3 票を集める。
@@ -528,6 +550,114 @@ DONE"#,
         }
         // ファイルは Worker のツール呼び出しで実体が書き込まれている。
         assert!(root.join("hello.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn run_step_streaming_pipes_tool_outputs_into_sink() {
+        // Worker が edit_file を呼んだら、ツール実行結果 (= "wrote N bytes …") が
+        // tool_output_sink に流れることを確認する。これが流れていないと UI のログペインに
+        // コマンド結果が出ず、ユーザは何が起きたか見えない。
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let reg = registry(root.clone());
+        let worker = Arc::new(MockLlmClient::new("worker"));
+        let sup = Arc::new(MockLlmClient::new("sup"));
+        let obs = Arc::new(MockLlmClient::new("obs"));
+        worker.push(ScriptedTurn::new(
+            r#"```json
+{"tool":"edit_file","args":{"path":"hi.rs","content":"fn main(){}"}}
+```
+DONE"#,
+        ));
+        sup.push(ScriptedTurn::new(approve(0.9)));
+        obs.push(ScriptedTurn::new(approve(0.85)));
+        worker.push(ScriptedTurn::new(approve(0.85)));
+        let trio = Trio::new(
+            Agent::new(AgentRole::Worker, worker, "worker-system"),
+            Agent::new(AgentRole::Supervisor, sup, "supervisor-system"),
+            Agent::new(AgentRole::Observer, obs, "observer-system"),
+        );
+
+        let (tx, mut rx) = ThrustChannel::new();
+        tx.send(UserThrust::Go { strength: 1.0 }).unwrap();
+
+        // sink が受け取った行を集める。
+        let collected = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_collected = collected.clone();
+        let tool_sink: DeltaSink = Arc::new(move |line: String| {
+            sink_collected.lock().unwrap().push(line);
+        });
+        let worker_sink: DeltaSink = Arc::new(|_: String| {});
+
+        let _ = trio
+            .run_step_streaming(
+                &[ChatMessage::user("hi.rs を作って")],
+                &reg,
+                &mut rx,
+                None,
+                worker_sink,
+                Some(tool_sink),
+            )
+            .await
+            .unwrap();
+
+        let lines = collected.lock().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("tool[edit_file]")),
+            "expected a 'tool[edit_file]' line in sink output, got: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_step_streaming_emits_tool_failed_into_sink() {
+        // 存在しないツールを呼ぶと NotFound エラーになり、`tool[..] failed: ...` で sink に流れる。
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let reg = registry(root.clone());
+        let worker = Arc::new(MockLlmClient::new("worker"));
+        let sup = Arc::new(MockLlmClient::new("sup"));
+        let obs = Arc::new(MockLlmClient::new("obs"));
+        worker.push(ScriptedTurn::new(
+            r#"```json
+{"tool":"definitely_not_a_tool","args":{}}
+```
+DONE"#,
+        ));
+        sup.push(ScriptedTurn::new(approve(0.9)));
+        obs.push(ScriptedTurn::new(approve(0.85)));
+        worker.push(ScriptedTurn::new(approve(0.85)));
+        let trio = Trio::new(
+            Agent::new(AgentRole::Worker, worker, "worker-system"),
+            Agent::new(AgentRole::Supervisor, sup, "supervisor-system"),
+            Agent::new(AgentRole::Observer, obs, "observer-system"),
+        );
+        let (tx, mut rx) = ThrustChannel::new();
+        tx.send(UserThrust::Go { strength: 1.0 }).unwrap();
+
+        let collected = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_collected = collected.clone();
+        let tool_sink: DeltaSink = Arc::new(move |line: String| {
+            sink_collected.lock().unwrap().push(line);
+        });
+        let worker_sink: DeltaSink = Arc::new(|_: String| {});
+
+        let _ = trio
+            .run_step_streaming(
+                &[ChatMessage::user("壊れたツールを呼ぶ")],
+                &reg,
+                &mut rx,
+                None,
+                worker_sink,
+                Some(tool_sink),
+            )
+            .await
+            .unwrap();
+
+        let lines = collected.lock().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("failed") && l.contains("definitely_not_a_tool")),
+            "expected a failure line in sink output, got: {lines:?}"
+        );
     }
 
     #[tokio::test]

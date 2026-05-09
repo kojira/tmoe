@@ -19,8 +19,8 @@ pub mod web;
 pub use apply_patch::{apply_hunks, parse_patch, ApplyPatchError, ApplyPatchTool, Hunk, UpdateChunk};
 pub use explore::{GrepTextTool, ListFilesTool};
 pub use git::{
-    carve_worktree, cleanup_worktree, commit as git_commit, stage_all, working_diff_text,
-    GitError, GitResult, WorktreeHandle,
+    carve_worktree, cleanup_worktree, commit as git_commit, delete_feature_branch, stage_all,
+    working_diff_text, GitError, GitResult, WorktreeHandle,
 };
 pub use permission::{Permission, PermissionProfile};
 pub use registry::ToolRegistry;

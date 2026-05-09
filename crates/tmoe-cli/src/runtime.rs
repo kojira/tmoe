@@ -36,9 +36,10 @@ use tmoe_history::{
 };
 use tmoe_llm::{ChatMessage, LlmClient, OpenAiCompatClient};
 use tmoe_tools::{
-    carve_worktree, cleanup_worktree, default_blocklist, git_commit, stage_all, ApplyPatchTool,
-    EditFileTool, GrepTextTool, ListFilesTool, PatchFileTool, ReadFileTool, RunCmdTool,
-    ToolRegistry, WebFetchTool, WebSearchTool, WorktreeHandle,
+    carve_worktree, cleanup_worktree, default_blocklist, delete_feature_branch, git_commit,
+    stage_all, working_diff_text, ApplyPatchTool, EditFileTool, GrepTextTool, ListFilesTool,
+    PatchFileTool, ReadFileTool, RunCmdTool, ToolRegistry, WebFetchTool, WebSearchTool,
+    WorktreeHandle,
 };
 
 use crate::agents_md;
@@ -391,6 +392,22 @@ pub async fn run_feature(
         std::sync::Arc::new(cb) as DeltaSink
     });
 
+    // Worker が呼んだツールの実行結果を TrioLog に流す sink。複数行 stdout は 1 行に
+    // 圧縮せずそのまま流したいので、改行で分割して 1 行ずつ送る (右ペインの List は
+    // 1 行 1 entry なので長文は折り返さず切れる代わりに、行ごとに見える)。
+    let tool_output_sink: Option<DeltaSink> = event_tx.as_ref().map(|tx| {
+        let tx = tx.clone();
+        let cb = move |body: String| {
+            for line in body.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let _ = tx.try_send(RuntimeEvent::TrioLog(line.to_string()));
+            }
+        };
+        std::sync::Arc::new(cb) as DeltaSink
+    });
+
     // --- セッションループ ---
     let mut rounds_used: u32 = 0;
     let mut last_committed: Option<(AppendRaw, String)> = None;
@@ -402,9 +419,16 @@ pub async fn run_feature(
         rounds_used += 1;
         let provider = HistoryViewProvider::new(&store, feature.id.clone());
         let outcome = if let Some(sink) = worker_delta_sink.clone() {
-            trio.run_step_streaming(&messages, &tools, &mut thrust_rx, Some(&provider), sink)
-                .await
-                .context("Trio.run_step_streaming failed")?
+            trio.run_step_streaming(
+                &messages,
+                &tools,
+                &mut thrust_rx,
+                Some(&provider),
+                sink,
+                tool_output_sink.clone(),
+            )
+            .await
+            .context("Trio.run_step_streaming failed")?
         } else {
             trio.run_step_with_views(&messages, &tools, &mut thrust_rx, Some(&provider))
                 .await
@@ -587,6 +611,15 @@ enum SessionOutcome {
     Aborted(String),
 }
 
+/// worktree に未コミットの変更があるか判定する。
+/// `working_diff_text` が空文字列を返したら「変更なし」、エラー時は安全側 (= true) に倒す。
+/// finalize_worktree から空コミット防止の判定として呼ぶ。
+fn worktree_has_pending_changes(h: &WorktreeHandle) -> bool {
+    working_diff_text(h)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(true)
+}
+
 // `force_cleanup` は `CommittedNoOp` 経路から「コミットしないが branch は消す」を要求するフラグ。
 // `opts.cleanup_worktree` が false でも、これが true なら worktree prune を実行する。
 fn finalize_worktree<F1, F2>(
@@ -607,31 +640,57 @@ fn finalize_worktree<F1, F2>(
         }
         return;
     };
+    // 空コミット防止: tool_calls.is_empty() の防壁を通過しても、tail / read_file 等の
+    // 読み取り専用ツールしか呼ばれていない場合は worktree のファイルが何も変わらない。
+    // git2 は parent と同じ tree でも空コミットを作るので、ここで diff を見て弾かないと
+    // feature ブランチに空コミットが量産される。
+    let mut actually_committed = false;
     if committed {
         if let Err(e) = stage_all(h) {
             warn(format!("git stage failed: {e}"));
         }
-        let msg = format!("tmoe[{feature_id}]: {}", opts.task);
-        match git_commit(h, "tmoe", "tmoe@local", &msg) {
-            Ok(oid) => say(format!(
-                "committed {} on {}",
-                short(&oid.to_string(), 10),
-                h.branch_name
-            )),
-            Err(e) => warn(format!("git commit failed: {e}")),
-        }
-        if opts.open_pr {
-            run_gh_pr_create(h, opts, feature_id, say, warn);
+        let has_diff = worktree_has_pending_changes(h);
+        if !has_diff {
+            say("no file changes — skipping commit".into());
+            if opts.open_pr {
+                warn("session produced no file changes; skipping --pr".into());
+            }
+        } else {
+            let msg = format!("tmoe[{feature_id}]: {}", opts.task);
+            match git_commit(h, "tmoe", "tmoe@local", &msg) {
+                Ok(oid) => {
+                    say(format!(
+                        "committed {} on {}",
+                        short(&oid.to_string(), 10),
+                        h.branch_name
+                    ));
+                    actually_committed = true;
+                }
+                Err(e) => warn(format!("git commit failed: {e}")),
+            }
+            if actually_committed && opts.open_pr {
+                run_gh_pr_create(h, opts, feature_id, say, warn);
+            }
         }
     } else if opts.open_pr {
         warn("session ended with no file changes; skipping --pr".into());
     }
 
-    if opts.cleanup_worktree || force_cleanup {
+    // 空コミット相当 (= 実際には commit しなかった) なら branch を残す意味が無いので cleanup。
+    let must_cleanup = opts.cleanup_worktree || force_cleanup || (committed && !actually_committed);
+    let no_history_to_keep = (committed && !actually_committed) || force_cleanup;
+    if must_cleanup {
         let cloned = (*h).clone();
         match cleanup_worktree(cloned) {
             Ok(()) => say(format!("worktree pruned: {}", h.worktree_path.display())),
             Err(e) => warn(format!("worktree cleanup failed: {e}")),
+        }
+        // commit が無いなら branch ref も削除 (`git branch` を汚さない)。通常 commit
+        // 経路では branch にユーザの履歴が乗っているので残す。
+        if no_history_to_keep {
+            if let Err(e) = delete_feature_branch(h) {
+                warn(format!("branch delete failed: {e}"));
+            }
         }
     }
 }
@@ -1021,6 +1080,51 @@ mod tests {
         assert!(!is_git_repo(path));
         git2::Repository::init(path).unwrap();
         assert!(is_git_repo(path));
+    }
+
+    #[test]
+    fn worktree_has_pending_changes_returns_false_for_clean_worktree() {
+        // 親 repo を作って worktree を切り出した直後は変更ゼロのはず。
+        // この判定が空コミット防止の唯一のゲートなので、ここの不変条件を直接覆う。
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let repo = git2::Repository::init(&repo_path).unwrap();
+        std::fs::write(repo_path.join("README.md"), "init\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("README.md")).unwrap();
+        let tree_oid = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("t", "t@x").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+
+        let h = tmoe_tools::carve_worktree(&repo_path, "feat-clean", None).unwrap();
+        assert!(
+            !worktree_has_pending_changes(&h),
+            "freshly carved worktree should have no pending changes"
+        );
+    }
+
+    #[test]
+    fn worktree_has_pending_changes_returns_true_after_file_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let repo = git2::Repository::init(&repo_path).unwrap();
+        std::fs::write(repo_path.join("README.md"), "init\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("README.md")).unwrap();
+        let tree_oid = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("t", "t@x").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+
+        let h = tmoe_tools::carve_worktree(&repo_path, "feat-dirty", None).unwrap();
+        std::fs::write(h.worktree_path.join("new.rs"), "fn x(){}\n").unwrap();
+        assert!(
+            worktree_has_pending_changes(&h),
+            "worktree with new file should report pending changes"
+        );
     }
 
     #[test]
