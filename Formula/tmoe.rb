@@ -19,24 +19,24 @@
 class Tmoe < Formula
   desc "3-agent collaborative coding agent (Worker / Supervisor / Observer + user as Z-axis)"
   homepage "https://github.com/kojira/tmoe"
-  version "0.3.7" # tmoe:version
+  version "0.3.8" # tmoe:version
   license "Apache-2.0"
 
   on_macos do
     on_arm do
       url "https://github.com/kojira/tmoe/releases/download/v#{version}/tmoe-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "cb75ae63c5f5056464e32d28a07129ced0dc434afaecdd5318957a2428413be9" # tmoe:sha:aarch64-apple-darwin
+      sha256 "adaa438da58cea07a0cf40cca195ea6e0f90737f9ee3e847c73e4e14605a8f0b" # tmoe:sha:aarch64-apple-darwin
     end
     on_intel do
       url "https://github.com/kojira/tmoe/releases/download/v#{version}/tmoe-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "57f9f6f9acc208bd8eed40fd8e2675834969741e98015836803863a068675e9b" # tmoe:sha:x86_64-apple-darwin
+      sha256 "4ac8268b875694e10b73e4339223930e799c859bc01aa484a72a548227205ddf" # tmoe:sha:x86_64-apple-darwin
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/kojira/tmoe/releases/download/v#{version}/tmoe-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "a6dd248cbd7257b93d75ace4d1ed5647aeb25bc4ce7ad47a56818d7285c633a6" # tmoe:sha:x86_64-unknown-linux-gnu
+      sha256 "d9f928bf86c7e54b927cb5b1f189f0401c29363d186f7d1add36954880530bac" # tmoe:sha:x86_64-unknown-linux-gnu
     end
   end
 
