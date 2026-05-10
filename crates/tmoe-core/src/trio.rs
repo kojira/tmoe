@@ -9,7 +9,7 @@
 //! 多数決ではない: 1 人でも反対していれば前進しない。
 //! 平面が均整していても Z が無ければ park し、Concierge は常時受付可能のまま入力を待つ。
 
-use crate::agent::{single_agent_loop_streaming, AgentRole, DeltaSink};
+use crate::agent::{single_agent_loop_streaming_with_tool_sink, AgentRole, DeltaSink};
 use crate::proposal::Proposal;
 use crate::thrust::{ThrustReceiver, UserThrust};
 use crate::vote::{triangle_balance, Vote};
@@ -179,34 +179,20 @@ impl Trio {
             //    user_messages の後ろに直前ターンのフィードバックを連結する。
             let mut worker_input = user_messages.to_vec();
             worker_input.extend(feedback.clone());
-            let pm = single_agent_loop_streaming(
+            // Worker の multi-step ループに on_tool_output sink を直接渡す。
+            // 各 step で tool が実行された直後に sink が呼ばれるので、ループ最後の
+            // DONE step (= tool_calls が空) でも中間 step の tool 出力は拾える。
+            let pm = single_agent_loop_streaming_with_tool_sink(
                 AgentRole::Worker,
                 &self.worker.system,
                 worker_input,
                 self.worker.llm.as_ref(),
                 tools,
                 on_worker_delta.clone(),
+                on_tool_output.clone(),
             )
             .await?;
             let proposal = pm.proposal;
-            // 各 tool 実行結果を sink に流す (= ユーザに見える形でログペインへ)。
-            // tool_outputs は proposal.tool_calls と同じ順序で並ぶ前提。
-            if let Some(sink) = on_tool_output.as_ref() {
-                for (call, result) in proposal.tool_calls.iter().zip(pm.tool_outputs.iter()) {
-                    let body = match result {
-                        Ok(out) => {
-                            let trimmed = out.stdout.trim_end_matches('\n');
-                            if trimmed.is_empty() {
-                                format!("tool[{}]: (no output)", call.name)
-                            } else {
-                                format!("tool[{}]: {}", call.name, trimmed)
-                            }
-                        }
-                        Err(e) => format!("tool[{}] failed: {}", call.name, e),
-                    };
-                    sink(body);
-                }
-            }
             last_proposal = proposal.clone();
 
             // 2) Supervisor / Observer / Worker 自己評価で 3 票を集める。

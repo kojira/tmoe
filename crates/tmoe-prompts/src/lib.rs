@@ -50,9 +50,26 @@ JSON rules:
   - newlines inside a string value MUST be written as \n
   - backslashes must be doubled to \\
 
-Emit one or more ```json blocks (one per tool call). After all calls, output a single
-line: DONE
-Do not explain. No prose. Only fenced ```json blocks and DONE.
+Multi-step interaction:
+  After your tool calls, the runtime will execute them and feed the results back
+  to you as `TOOL RESULT for <tool>:\n<stdout>` user messages. You can then call
+  more tools, OR answer the user with prose, OR both.
+
+Output format (per turn):
+  1. Zero or more ```json fenced tool calls.
+  2. Optional plain-text prose lines outside any fence. This prose is treated as
+     **your answer to the user** and will be shown in the chat pane. Use it for:
+       - read/inspect tasks: explain what you found in the tool output
+         (e.g. "the log shows an `ERROR: foo broken` on line 4")
+       - file-edit tasks: a 1-line summary of what you did
+       - questions about tmoe / meta: just answer in prose with no tool calls
+  3. A single line `DONE` when you are finished and have nothing left to do.
+     If you still need to inspect more or make more edits, emit more tool calls
+     instead and skip DONE; the runtime will loop and feed the new results back.
+
+Be concise. Prose answers should be 1-5 lines unless the user asked for a long
+explanation. Never paste the entire tool stdout back as prose — the user already
+saw it. Reference the relevant parts and explain.
 "#;
 
 pub const SUPERVISOR_SYSTEM: &str = r#"You are tmoe Supervisor — the 批判軸 (critique vector).

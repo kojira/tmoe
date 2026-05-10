@@ -377,7 +377,11 @@ async fn run_headless(
         .map_err(|e| anyhow::anyhow!("send thrust: {e}"))?;
     drop(thrust_tx);
 
-    let (event_tx, mut event_rx) = mpsc::channel::<RuntimeEvent>(64);
+    // 2048 = LLM の token streaming や tool 出力 (複数行 stdout) を 150ms tick の
+    // event drain が消化する間に溜まっても drop しないだけの余裕。元 64 だと Codex の
+    // chunked streaming で Worker token が一気に流れ込んだ時 ConciergeReply (tool 出力 /
+    // Worker note) が `try_send` の buffer 不足で捨てられる症状が起きていた。
+    let (event_tx, mut event_rx) = mpsc::channel::<RuntimeEvent>(2048);
 
     let runner = tokio::spawn(async move {
         let mut opts = RunOptions::new(task, workdir);
@@ -492,7 +496,11 @@ fn tui_loop<B: ratatui::backend::Backend>(
     // 外側 `#[tokio::main]` runtime の handle を借りる。内部で別 runtime を立てると
     // drop 時に async context で blocking ができず panic するので絶対やらない。
     let handle = tokio::runtime::Handle::current();
-    let (event_tx, mut event_rx) = mpsc::channel::<RuntimeEvent>(64);
+    // 2048 = LLM の token streaming や tool 出力 (複数行 stdout) を 150ms tick の
+    // event drain が消化する間に溜まっても drop しないだけの余裕。元 64 だと Codex の
+    // chunked streaming で Worker token が一気に流れ込んだ時 ConciergeReply (tool 出力 /
+    // Worker note) が `try_send` の buffer 不足で捨てられる症状が起きていた。
+    let (event_tx, mut event_rx) = mpsc::channel::<RuntimeEvent>(2048);
 
     let mut app = App::new();
     app.on_concierge("(tmoe) Type a task and press Enter to start.".into());
@@ -558,11 +566,10 @@ fn tui_loop<B: ratatui::backend::Backend>(
                     // chat の場合: ConciergeReply 側で表示済みなので何もしない。
                 }
                 RuntimeEvent::Done { ok, message } => {
-                    app.on_concierge(format!(
-                        "(tmoe) {} {message}",
-                        if ok { "✓ done:" } else { "✗ failed:" }
-                    ));
-                    // セッション終了 → アイドルに戻す。次の Concierge 入力で新規セッションを spawn できる。
+                    // Worker の答え本文は ConciergeReply で既に流れている。ここは完了/失敗の
+                    // 端的な印だけ。message は "done." / "stopped." 等のごく短い文言。
+                    let mark = if ok { "✓" } else { "✗" };
+                    app.on_concierge(format!("(tmoe) {mark} {message}"));
                     current_thrust_tx = None;
                 }
             }
@@ -756,7 +763,7 @@ fn spawn_session(
     thrust_rx: tmoe_core::ThrustReceiver,
     event_tx: mpsc::Sender<RuntimeEvent>,
     runtime_handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
-    app: &mut App,
+    _app: &mut App,
 ) {
     *runtime_handle = Some(handle.spawn(async move {
         let mut opts = RunOptions::new(task, workdir);
@@ -767,7 +774,8 @@ fn spawn_session(
         opts.resume_feature_id = flags.resume_feature_id.clone();
         run_feature(cfg, opts, thrust_rx, Some(event_tx)).await
     }));
-    app.on_concierge("(tmoe) feature spawned.".into());
+    // 内部用語 (= "feature spawned") はユーザに見せない。動いてる感は Trio ペインの
+    // ステータス表示と Worker の最終 reply で十分伝わる。
 }
 
 fn send_thrust(tx: &ThrustSender, app: &mut App, thrust: UserThrust, label: &str) {

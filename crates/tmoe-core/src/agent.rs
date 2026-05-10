@@ -446,6 +446,12 @@ pub async fn single_agent_loop(
 ///
 /// stream の途中で I/O エラーが起きた場合は **そこまでに溜まった content** で proposal を
 /// パースして返す (= 部分結果も活かす)。完全失敗時のみ Err を返す。
+/// Worker が tool 結果を踏まえた回答を作るための内部 multi-step 上限。
+/// 1 ステップ = LLM 1 回呼出 + その proposal の tool 群を実行。`DONE` か tool_calls
+/// が空になれば打ち切り。実機では 2-3 step で収束するが、tail のような探索 task では
+/// 数 step かかることもあるので余裕をもって 8 まで許す。
+const WORKER_MAX_STEPS: u32 = 8;
+
 pub async fn single_agent_loop_streaming(
     role: AgentRole,
     system: &str,
@@ -454,62 +460,121 @@ pub async fn single_agent_loop_streaming(
     tools: &ToolRegistry,
     on_delta: Option<DeltaSink>,
 ) -> anyhow::Result<ProposalMessage> {
+    single_agent_loop_streaming_with_tool_sink(role, system, user_messages, llm, tools, on_delta, None).await
+}
+
+pub async fn single_agent_loop_streaming_with_tool_sink(
+    role: AgentRole,
+    system: &str,
+    user_messages: Vec<ChatMessage>,
+    llm: &dyn LlmClient,
+    tools: &ToolRegistry,
+    on_delta: Option<DeltaSink>,
+    on_tool_output: Option<DeltaSink>,
+) -> anyhow::Result<ProposalMessage> {
     use futures::StreamExt;
     let mut messages = Vec::with_capacity(user_messages.len() + 1);
     messages.push(ChatMessage::system(system));
     messages.extend(user_messages);
 
-    // Worker は "提案を出して DONE" で止まるはずだが、メタ質問など open-ended な入力では
-    // LLM が同じツール呼び出しを延々と stream し続けることがあるので max_tokens を必ず張る。
-    // 数千トークンあれば実用的な提案 (数〜十数個のツール呼び出し + DONE) は収まる。
-    let worker_chat_request = || ChatRequest {
-        messages: messages.clone(),
-        max_tokens: Some(4096),
-        temperature: Some(0.2),
-        ..Default::default()
-    };
+    let profile = role.permission_profile();
+    let is_worker = matches!(role, AgentRole::Worker);
+    let max_steps: u32 = if is_worker { WORKER_MAX_STEPS } else { 1 };
 
-    let content: String = if let Some(sink) = on_delta {
-        let mut stream = llm
-            .chat_stream(worker_chat_request())
-            .await?;
-        let mut acc = String::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(tmoe_llm::ChatDelta::Token(piece)) => {
-                    sink(piece.clone());
-                    acc.push_str(&piece);
-                }
-                Ok(tmoe_llm::ChatDelta::Done { .. }) => break,
-                Err(e) => {
-                    // 部分応答で proposal が成立する可能性がある (DONE 行や閉じフェンスがすでに来ている等)。
-                    // 完全切断扱いせず、ログだけ出して acc で先に進む。
-                    tracing::warn!("stream error after {} chars: {e}", acc.len());
-                    break;
+    let mut last_proposal = Proposal::empty();
+    let mut all_tool_outputs: Vec<tmoe_tools::ToolResult> = Vec::new();
+
+    for step in 0..max_steps {
+        // Worker は "提案を出して DONE" で止まるはずだが、メタ質問など open-ended な入力では
+        // LLM が同じツール呼び出しを延々と stream し続けることがあるので max_tokens を必ず張る。
+        let chat_request = ChatRequest {
+            messages: messages.clone(),
+            max_tokens: Some(4096),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+
+        let content: String = if let Some(sink) = on_delta.as_ref() {
+            let mut stream = llm.chat_stream(chat_request).await?;
+            let mut acc = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(tmoe_llm::ChatDelta::Token(piece)) => {
+                        sink(piece.clone());
+                        acc.push_str(&piece);
+                    }
+                    Ok(tmoe_llm::ChatDelta::Done { .. }) => break,
+                    Err(e) => {
+                        // 部分応答で proposal が成立する可能性がある (DONE 行や閉じフェンスがすでに来ている等)。
+                        tracing::warn!("stream error after {} chars: {e}", acc.len());
+                        break;
+                    }
                 }
             }
-        }
-        // stream 終了の合図として末尾に改行を 1 つ流す。`worker_delta_sink` は改行で
-        // 行を確定させる buffer 方式なので、Codex のように chunk 内に改行を含まない
-        // バックエンドだと最後の 1 行が flush されず Trio ペインに何も出ない症状になる。
-        // ここで明示的に "\n" を流して必ず最終行を吐かせる。
-        sink("\n".to_string());
-        acc
-    } else {
-        llm.chat(worker_chat_request()).await?.content
-    };
+            // stream 終了の合図として末尾に改行を 1 つ流す。
+            sink("\n".to_string());
+            acc
+        } else {
+            llm.chat(chat_request).await?.content
+        };
 
-    let proposal = parse_proposal(&content);
-    let profile = role.permission_profile();
-    let mut tool_outputs = Vec::with_capacity(proposal.tool_calls.len());
-    if matches!(role, AgentRole::Worker) {
-        for call in &proposal.tool_calls {
-            let r = tools.invoke(call, &profile).await;
-            tool_outputs.push(r);
+        let proposal = parse_proposal(&content);
+        // assistant 発話を message 履歴に積んで、次ターン LLM が自分の発話を見られるようにする。
+        messages.push(ChatMessage::assistant(&content));
+
+        // Worker のみ: 各 tool を実行して結果を **次ターンの user message** として食わせる。
+        // これが無いと LLM は tool を呼んだだけで結果を見られず「実行結果を踏まえた回答」を
+        // 作れない。
+        let mut step_outputs: Vec<tmoe_tools::ToolResult> = Vec::new();
+        if is_worker {
+            for call in &proposal.tool_calls {
+                let r = tools.invoke(call, &profile).await;
+                let result_msg = match &r {
+                    Ok(out) => format!(
+                        "TOOL RESULT for {}:\n{}",
+                        call.name,
+                        out.stdout.trim_end_matches('\n')
+                    ),
+                    Err(e) => format!("TOOL ERROR for {}: {e}", call.name),
+                };
+                messages.push(ChatMessage::user(result_msg.clone()));
+                // tool 出力 sink にもここで流す (= UI のチャットペインに表示)。
+                // multi-step ループだと last_proposal.tool_calls が DONE step で空に
+                // なるので、trio 側で zip する旧方式だと最後の step の tool が拾えても
+                // 中間 step の tool が拾えない。ここで step ごとに呼ぶのが正解。
+                if let Some(sink) = on_tool_output.as_ref() {
+                    let body = match &r {
+                        Ok(out) => {
+                            let trimmed = out.stdout.trim_end_matches('\n');
+                            if trimmed.is_empty() {
+                                format!("tool[{}]: (no output)", call.name)
+                            } else {
+                                format!("tool[{}]: {}", call.name, trimmed)
+                            }
+                        }
+                        Err(e) => format!("tool[{}] failed: {}", call.name, e),
+                    };
+                    sink(body);
+                }
+                step_outputs.push(r);
+            }
+        }
+        // proposal を「現時点の最終結果」として記録 (= 次 step が無ければこれが最終)。
+        last_proposal = proposal.clone();
+        all_tool_outputs.extend(step_outputs);
+
+        // 終了判定: DONE が出たか、tool を 1 つも呼ばなかったら次の step は要らない。
+        if proposal.done || proposal.tool_calls.is_empty() {
+            tracing::debug!("worker loop: step {step}/{max_steps} done={} tools={}",
+                proposal.done, proposal.tool_calls.len());
+            break;
         }
     }
-    let _ = Arc::new(()); // 静的解析: Arc を依存に残しておく (将来の同時呼び出し対応)
-    Ok(ProposalMessage { proposal, tool_outputs })
+
+    Ok(ProposalMessage {
+        proposal: last_proposal,
+        tool_outputs: all_tool_outputs,
+    })
 }
 
 #[cfg(test)]

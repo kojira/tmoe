@@ -83,9 +83,9 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),    // concierge
-                Constraint::Length(8), // trio
-                Constraint::Length(4), // observer warnings
-                Constraint::Length(7), // features
+                Constraint::Length(5), // trio
+                Constraint::Length(3), // observer warnings
+                Constraint::Length(5), // features
                 Constraint::Length(1), // status
                 Constraint::Length(1), // input bar
             ])
@@ -180,21 +180,21 @@ impl App {
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // 縦並び (横分割なし) に変更。横分割は wrap 計算が複雑になり、長文の右端で
-        // 文字が切れる症状が出やすいので避ける。代わりに各ペインを画面全幅で縦に積む。
-        //   ① Concierge (Min, Paragraph::wrap で自動改行)
-        //   ② Trio (固定 8 行)
-        //   ③ Observer warnings (固定 4 行)
-        //   ④ Features (固定 7 行)
+        // 縦並び。Concierge ペインに重みを置いて、内部状態 (Trio / Observer / Features)
+        // は最低限のサマリ表示でスペースを節約する。
+        //   ① Concierge (Min, Paragraph::wrap で自動改行) — メインの会話領域
+        //   ② Trio (5 行) — 進捗 + vote (Paragraph::wrap で長文も改行)
+        //   ③ Observer warnings (3 行) — 通常空、何かあった時だけ表示
+        //   ④ Features (5 行)
         //   ⑤ status (border 無し 1 行)
         //   ⑥ input bar (border 無し 1 行)
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
-                Constraint::Length(8),
-                Constraint::Length(4),
-                Constraint::Length(7),
+                Constraint::Length(5),
+                Constraint::Length(3),
+                Constraint::Length(5),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
@@ -224,19 +224,23 @@ impl Widget for &App {
             .block(Block::default().borders(Borders::ALL).title("Concierge"))
             .render(concierge_pane, buf);
 
+        // Trio / Observer warnings は Paragraph::wrap で長文を改行で全文表示。
+        // List だと 1 item 1 行で右端で切れて読めなくなる (vote の note や警告 message)。
         Clear.render(trio_pane, buf);
         let trio_visible = App::tail(&self.trio_log, trio_n);
-        let trio_items: Vec<ListItem> =
-            trio_visible.iter().map(|s| ListItem::new(s.as_str())).collect();
-        List::new(trio_items)
+        let trio_lines: Vec<Line> =
+            trio_visible.iter().map(|s| Line::from(s.as_str())).collect();
+        Paragraph::new(trio_lines)
+            .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("Trio (Worker/Supervisor/Observer)"))
             .render(trio_pane, buf);
 
         Clear.render(warn_pane, buf);
         let warn_visible = App::tail(&self.observer_warnings, warn_n);
-        let warn_items: Vec<ListItem> =
-            warn_visible.iter().map(|s| ListItem::new(s.as_str())).collect();
-        List::new(warn_items)
+        let warn_lines: Vec<Line> =
+            warn_visible.iter().map(|s| Line::from(s.as_str())).collect();
+        Paragraph::new(warn_lines)
+            .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("Observer warnings"))
             .render(warn_pane, buf);
 

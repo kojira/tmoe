@@ -372,23 +372,13 @@ pub async fn run_feature(
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::user(initial_prompt)];
     say("Trio starting (Worker / Supervisor / Observer)...".into());
 
-    // Worker の応答 token を **改行ごと** にまとめて RuntimeEvent::TrioLog に流す sink。
-    // event_tx が無ければ作らない (= headless で stderr 出力だけのとき streaming 不要)。
-    let worker_delta_sink: Option<DeltaSink> = event_tx.as_ref().map(|tx| {
-        let tx = tx.clone();
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let buf2 = buf.clone();
-        let cb = move |piece: String| {
-            let mut b = buf2.lock().unwrap();
-            b.push_str(&piece);
-            while let Some(idx) = b.find('\n') {
-                let line: String = b.drain(..=idx).collect();
-                let line = line.trim_end_matches('\n');
-                if !line.trim().is_empty() {
-                    let _ = tx.try_send(RuntimeEvent::TrioLog(format!("worker: {line}")));
-                }
-            }
-        };
+    // Worker の応答 token は file (`~/.tmoe/tmoe.log`) には残すが、TUI の Trio ペインに
+    // 流すのはやめる: 一般ユーザにとって生 JSON tool call の token streaming は読めず、
+    // 表示が破壊されるだけ。詳細は `tmoe history show <id>` や file log を見てもらう想定。
+    // ただし single_agent_loop_streaming は streaming パスを使う (= Codex は stream 必須) ので、
+    // 何もしない空 closure を渡して streaming だけ走らせる。
+    let worker_delta_sink: Option<DeltaSink> = event_tx.as_ref().map(|_| {
+        let cb = |_piece: String| {};
         std::sync::Arc::new(cb) as DeltaSink
     });
 
@@ -440,12 +430,16 @@ pub async fn run_feature(
 
         match outcome.last {
             ConsensusOutcome::Commit { proposal, votes } => {
+                // 投票結果の Trio ペイン表示は短く ` Worker ✓ 0.95: <note>` の形にして、
+                // 全文 (改行込み) を流す。ペイン側は Paragraph::wrap で長文を折り返す前提。
+                let agents = ["Worker", "Sup", "Obs"];
                 for (i, v) in votes.iter().enumerate() {
+                    let mark = if v.approve { "✓" } else { "✗" };
+                    let label = agents.get(i).copied().unwrap_or("?");
                     say(format!(
-                        "vote[{i}] approve={} confidence={:.2} note={}",
-                        v.approve,
+                        "{label} {mark} {:.2}: {}",
                         v.confidence,
-                        short(&v.note, 120)
+                        v.note.trim()
                     ));
                 }
                 let raw_body = format!(
@@ -463,16 +457,16 @@ pub async fn run_feature(
                     },
                     raw_body,
                 ));
-                if no_op {
-                    // ③ 防壁: Worker が proposal で 1 つもツールを呼ばなかった = chat に近い回答。
-                    // worktree commit / PR / 3 view compaction は全部スキップ。Worker の prose
-                    // (= proposal.note の中身) をそのまま左 Concierge ペインに返事として流す。
-                    let reply = proposal.note.trim().to_string();
-                    if !reply.is_empty() {
-                        if let Some(tx) = &event_tx {
-                            let _ = tx.try_send(RuntimeEvent::ConciergeReply(reply.clone()));
-                        }
+                // Worker の最終 proposal.note (= tool 結果を踏まえた答え) を Concierge に流す。
+                // 以前は no_op (= tool 呼ばなかった chat 経路) のときだけ流していたが、
+                // tool を呼んだ Commit 経路でも note は「ユーザに対する答え」なので流す。
+                let reply = proposal.note.trim().to_string();
+                if !reply.is_empty() {
+                    if let Some(tx) = &event_tx {
+                        let _ = tx.try_send(RuntimeEvent::ConciergeReply(reply.clone()));
                     }
+                }
+                if no_op {
                     break SessionOutcome::CommittedNoOp { note: reply };
                 }
                 break SessionOutcome::Committed;
@@ -508,11 +502,21 @@ pub async fn run_feature(
                 }
             }
             ConsensusOutcome::Stopped => break SessionOutcome::Stopped,
-            ConsensusOutcome::Escalated { .. } => {
+            ConsensusOutcome::Escalated { last_proposal } => {
                 warn(format!(
                     "Trio escalated after {} internal iterations on round {}",
                     outcome.steps, rounds_used
                 ));
+                // 平面合意ができなくても、Worker が出した最終 note は「読んだ結果の
+                // 暫定回答」として持っているはず。silent に終わらず会話に流して
+                // ユーザに見せる (= 「could not reach a confident answer」だけでは
+                // 何も得るものがない)。
+                let reply = last_proposal.note.trim().to_string();
+                if !reply.is_empty() {
+                    if let Some(tx) = &event_tx {
+                        let _ = tx.try_send(RuntimeEvent::ConciergeReply(reply));
+                    }
+                }
                 break SessionOutcome::Escalated;
             }
         }
@@ -586,14 +590,14 @@ pub async fn run_feature(
         force_cleanup,
     );
 
+    // Done メッセージは内部用語 (feature id / committed / round) を出さず、ユーザ向けの
+    // 端的な完了表示に絞る。Worker の答え本文は既に ConciergeReply で会話に流れているので、
+    // ここはそのトリガで表示している `(tmoe) ✓ done.` 程度でよい。
     let (ok, msg) = match session_outcome {
-        SessionOutcome::Committed => (true, format!("feature {} committed in {} round(s)", feature.id, rounds_used)),
-        SessionOutcome::CommittedNoOp { note } => {
-            let preview = short(&note, 80);
-            (true, format!("no file changes ({preview})"))
-        }
-        SessionOutcome::Stopped => (false, "stopped by user".into()),
-        SessionOutcome::Escalated => (false, "escalated (Trio could not form plane)".into()),
+        SessionOutcome::Committed => (true, "done.".into()),
+        SessionOutcome::CommittedNoOp { .. } => (true, "done.".into()),
+        SessionOutcome::Stopped => (false, "stopped.".into()),
+        SessionOutcome::Escalated => (false, "could not reach a confident answer.".into()),
         SessionOutcome::Aborted(reason) => (false, format!("aborted: {reason}")),
     };
     done(&event_tx, ok, msg);
