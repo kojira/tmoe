@@ -144,10 +144,17 @@ pub async fn run_feature(
         }
         tracing::info!("{line}");
     };
+    // ユーザに見せるべき警告 (= タスク結果に影響する失敗)。Observer warnings ペインに出る。
     let warn = |line: String| {
         if let Some(tx) = &event_tx {
             let _ = tx.try_send(RuntimeEvent::Warning(line.clone()));
         }
+        tracing::warn!("{line}");
+    };
+    // 内部 fallback / debug 用の warning (= tmoe.log のみ、UI には出さない)。
+    // worktree carve fallback、cleanup 失敗、compaction エラー等の「動作には影響するが
+    // ユーザが何かする必要がない」情報は debug 用に file へ流すだけにする。
+    let dbg_warn = |line: String| {
         tracing::warn!("{line}");
     };
 
@@ -223,7 +230,7 @@ pub async fn run_feature(
                 p
             }
             Err(e) => {
-                warn(format!("worktree carve failed, falling back to workdir: {e}"));
+                dbg_warn(format!("worktree carve failed, falling back to workdir: {e}"));
                 opts.workdir.clone()
             }
         }
@@ -465,7 +472,7 @@ pub async fn run_feature(
                 break SessionOutcome::Committed;
             }
             ConsensusOutcome::Redirected { instruction } => {
-                warn(format!(
+                dbg_warn(format!(
                     "round {}/{}: redirect from user — {}",
                     rounds_used, opts.max_rounds, instruction
                 ));
@@ -496,7 +503,7 @@ pub async fn run_feature(
             }
             ConsensusOutcome::Stopped => break SessionOutcome::Stopped,
             ConsensusOutcome::Escalated { last_proposal } => {
-                warn(format!(
+                dbg_warn(format!(
                     "Trio escalated after {} internal iterations on round {}",
                     outcome.steps, rounds_used
                 ));
@@ -560,7 +567,7 @@ pub async fn run_feature(
                 if let Err(e) =
                     compact_turn_for_all(&store, &feature.id, &raw, &raw_body, &lenses).await
                 {
-                    warn(format!("compaction error (history not updated): {e}"));
+                    dbg_warn(format!("compaction error (history not updated): {e}"));
                 } else {
                     status("3 views updated by personality compaction".into());
                 }
@@ -636,24 +643,24 @@ fn finalize_worktree<F1, F2>(
 {
     let Some(h) = handle else {
         if opts.open_pr {
+            // --pr はユーザが明示的に頼んだのにスキップする = ユーザに通知すべき。
             warn("--pr requested but not in a git repo / worktree disabled; skipping".into());
         }
         return;
     };
     // 空コミット防止: tool_calls.is_empty() の防壁を通過しても、tail / read_file 等の
     // 読み取り専用ツールしか呼ばれていない場合は worktree のファイルが何も変わらない。
-    // git2 は parent と同じ tree でも空コミットを作るので、ここで diff を見て弾かないと
-    // feature ブランチに空コミットが量産される。
     let mut actually_committed = false;
     if committed {
         if let Err(e) = stage_all(h) {
+            // git stage の失敗は commit に直結する = ユーザに見せる。
             warn(format!("git stage failed: {e}"));
         }
         let has_diff = worktree_has_pending_changes(h);
         if !has_diff {
             say("no file changes — skipping commit".into());
             if opts.open_pr {
-                warn("session produced no file changes; skipping --pr".into());
+                tracing::warn!("session produced no file changes; skipping --pr");
             }
         } else {
             let msg = format!("tmoe[{feature_id}]: {}", opts.task);
@@ -673,7 +680,7 @@ fn finalize_worktree<F1, F2>(
             }
         }
     } else if opts.open_pr {
-        warn("session ended with no file changes; skipping --pr".into());
+        tracing::warn!("session ended with no file changes; skipping --pr");
     }
 
     // 空コミット相当 (= 実際には commit しなかった) なら branch を残す意味が無いので cleanup。
@@ -683,13 +690,11 @@ fn finalize_worktree<F1, F2>(
         let cloned = (*h).clone();
         match cleanup_worktree(cloned) {
             Ok(()) => say(format!("worktree pruned: {}", h.worktree_path.display())),
-            Err(e) => warn(format!("worktree cleanup failed: {e}")),
+            Err(e) => tracing::warn!("worktree cleanup failed: {e}"),
         }
-        // commit が無いなら branch ref も削除 (`git branch` を汚さない)。通常 commit
-        // 経路では branch にユーザの履歴が乗っているので残す。
         if no_history_to_keep {
             if let Err(e) = delete_feature_branch(h) {
-                warn(format!("branch delete failed: {e}"));
+                tracing::warn!("branch delete failed: {e}");
             }
         }
     }
