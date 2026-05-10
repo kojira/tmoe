@@ -571,6 +571,38 @@ pub async fn single_agent_loop_streaming_with_tool_sink(
         }
     }
 
+    // Worker が tool だけ呼び続けて prose 答えを書かないまま終わるケースの救援:
+    // tool 結果が積まれているのに last_proposal.note が空なら、もう 1 回だけ LLM を
+    // 呼んで「今までの結果から答えを書け」と指示する。
+    // ただし Worker が **DONE を宣言済み**の場合は意図的な「note 不要」(= ファイル編集
+    // 完了型タスク) なので発動しない。発動条件は「未完了 + tool 呼んだ + note 空」。
+    if is_worker
+        && !last_proposal.done
+        && last_proposal.note.trim().is_empty()
+        && !all_tool_outputs.is_empty()
+    {
+        messages.push(ChatMessage::user(
+            "Now that the tool results above are in front of you, write a SHORT prose \
+             answer (1-5 lines) explaining what the user asked. Do NOT call any more \
+             tools — emit no fenced code blocks at all. End with a single line `DONE`."
+                .to_string(),
+        ));
+        let final_request = ChatRequest {
+            messages: messages.clone(),
+            max_tokens: Some(1024),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        if let Ok(resp) = llm.chat(final_request).await {
+            let final_proposal = parse_proposal(&resp.content);
+            if !final_proposal.note.trim().is_empty() {
+                last_proposal.note = final_proposal.note;
+                last_proposal.done = final_proposal.done || last_proposal.done;
+                last_proposal.raw_text = resp.content;
+            }
+        }
+    }
+
     Ok(ProposalMessage {
         proposal: last_proposal,
         tool_outputs: all_tool_outputs,

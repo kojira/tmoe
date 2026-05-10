@@ -200,11 +200,11 @@ pub async fn run_feature(
         let f = store
             .get_feature(fid)
             .with_context(|| format!("resume feature {fid}: not found"))?;
-        status(format!("resuming feature_id={} title={}", f.id, f.title));
+        status(format!("resuming: {}", f.title));
         f
     } else {
         let f = store.create_feature(&opts.task).context("create feature row")?;
-        status(format!("feature_id={} task={}", f.id, opts.task));
+        status(format!("working on: {}", opts.task));
         f
     };
 
@@ -382,22 +382,15 @@ pub async fn run_feature(
         std::sync::Arc::new(cb) as DeltaSink
     });
 
-    // Worker が呼んだツールの実行結果を **Concierge** に流す sink。
-    // Trio ペインは Worker の token streaming や vote (= 内部状態) を見せる場所。
-    // 一方、tool が実行されて何が返ってきたかは「ユーザに対する答え」なので、
-    // チャット履歴の一部として Concierge ペインに残すのが UX として自然。
-    // 複数行 stdout は改行で分割して 1 行ずつ送る (Concierge は wrap 有効なので
-    // 長文も読める)。
-    let tool_output_sink: Option<DeltaSink> = event_tx.as_ref().map(|tx| {
-        let tx = tx.clone();
-        let cb = move |body: String| {
-            for line in body.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let _ = tx.try_send(RuntimeEvent::ConciergeReply(line.to_string()));
-            }
-        };
+    // Tool の生 stdout は UI に流さない。tail のような読み取りタスクで stdout を
+    // そのまま Concierge に dump すると、Worker の要約 (= 答え) が大量のログ行に
+    // 埋もれて読めなくなる。ユーザが欲しいのは「実行結果を踏まえた要約」であり、
+    // 生データではない。詳細は file (`~/.tmoe/tmoe.log`) で確認できる。
+    // sink 自体は agent.rs の multi-step ループに「ツール実行のタイミング合図」を
+    // 渡す目的で空 callback を入れておく (= 何も表示しないが、callback の有無で
+    // 機能差が出ないようにする)。
+    let tool_output_sink: Option<DeltaSink> = event_tx.as_ref().map(|_| {
+        let cb = |_body: String| {};
         std::sync::Arc::new(cb) as DeltaSink
     });
 

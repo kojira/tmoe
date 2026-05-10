@@ -1808,7 +1808,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tmoe-cli"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "tmoe-core"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "tmoe-history"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1875,7 +1875,7 @@ dependencies = [
 
 [[package]]
 name = "tmoe-llm"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1897,11 +1897,11 @@ dependencies = [
 
 [[package]]
 name = "tmoe-prompts"
-version = "0.3.13"
+version = "0.3.14"
 
 [[package]]
 name = "tmoe-rag"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "tmoe-tools"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "tmoe-tree"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "async-trait",
