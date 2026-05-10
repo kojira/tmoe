@@ -489,6 +489,11 @@ pub async fn single_agent_loop_streaming(
                 }
             }
         }
+        // stream 終了の合図として末尾に改行を 1 つ流す。`worker_delta_sink` は改行で
+        // 行を確定させる buffer 方式なので、Codex のように chunk 内に改行を含まない
+        // バックエンドだと最後の 1 行が flush されず Trio ペインに何も出ない症状になる。
+        // ここで明示的に "\n" を流して必ず最終行を吐かせる。
+        sink("\n".to_string());
         acc
     } else {
         llm.chat(worker_chat_request()).await?.content
@@ -520,6 +525,48 @@ mod tests {
         reg.register(Arc::new(EditFileTool { root: root.clone() }));
         reg.register(Arc::new(ReadFileTool { root }));
         reg
+    }
+
+    #[tokio::test]
+    async fn streaming_sink_receives_end_of_stream_newline_so_buffered_lines_get_flushed() {
+        // 改行を含まない単一 chunk で stream が終わると、`worker_delta_sink` のように
+        // 改行で line を確定する側が最後の 1 行を捨ててしまう。`single_agent_loop_streaming`
+        // は stream end に明示的に "\n" を流すことを保証する。これが無いと TUI の
+        // Trio ペインに `worker: ...` 行が一切出ない症状が再現する。
+        let dir = tempdir().unwrap();
+        let reg = make_registry(dir.path().to_path_buf());
+        let llm = MockLlmClient::new("worker");
+        // chunk 内に改行を含まない 1 トークンで完結する応答を仕込む。
+        // ScriptedTurn は streaming だと 1 文字ずつ chunk として返すので、最後の文字の
+        // 後ろに改行が無いケースになる (= "...DONE" で終わる)。
+        llm.push(ScriptedTurn::new(
+            r#"```json
+{"tool":"read_file","args":{"path":"hi.rs"}}
+```
+DONE"#,
+        ));
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let c2 = collected.clone();
+        let sink: DeltaSink = Arc::new(move |piece: String| {
+            c2.lock().unwrap().push_str(&piece);
+        });
+        let _ = single_agent_loop_streaming(
+            AgentRole::Worker,
+            "system",
+            vec![tmoe_llm::ChatMessage::user("hi")],
+            &llm,
+            &reg,
+            Some(sink),
+        )
+        .await
+        .unwrap();
+        let dump = collected.lock().unwrap().clone();
+        // 末尾に改行があることを保証 (= flush のための EOF newline)。
+        assert!(
+            dump.ends_with('\n'),
+            "stream-end newline should have been pushed; tail was: {:?}",
+            &dump[dump.len().saturating_sub(8)..]
+        );
     }
 
     #[test]

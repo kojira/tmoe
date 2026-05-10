@@ -14,7 +14,7 @@ use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::Widget;
@@ -420,7 +420,11 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        // EnterAlternateScreen 直後に Clear(All) を必ず出す。alt screen に **以前の
+        // セッションや stderr 由来の文字列** が残っていると、ratatui の差分描画は
+        // 「前 frame Buffer (空白) と今 frame Buffer (空白)」を比較して書き込まないため、
+        // ペイン内側に過去の tracing log や残骸が透けて見える原因になる。
+        execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
         Ok(TerminalGuard)
     }
 }
@@ -454,6 +458,10 @@ async fn run_tui(
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    // ratatui の差分描画は前 frame Buffer を保持しており、起動時の前 frame は空白
+    // (= empty buffer)。alt screen に何か残骸が書かれていても「前 frame と同じ」と判定
+    // して書き直さないため、明示的に clear して初回描画を完全描画にする。
+    let _ = terminal.clear();
     // tui_loop は同期 loop (terminal.draw + event::poll)。`#[tokio::main]` の async
     // context にいるので、内部で別 runtime を立てて drop すると tokio が
     // 「Cannot drop a runtime in a context where blocking is not allowed」で panic する。
