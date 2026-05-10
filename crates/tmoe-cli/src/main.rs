@@ -328,7 +328,9 @@ fn init_tracing_stderr() {
 }
 
 /// `<history_root>/tmoe.log` に tracing を流す (= TUI 起動中)。stderr に出すと ratatui の
-/// 描画の上に書き殴られて表示が壊れるのでファイルに逃がす。失敗したら sink にフォールバック。
+/// 描画と混じって TUI 表示が壊れるので、tracing-appender の non-blocking writer で
+/// 確実に file に書く (= MakeWriter trait の解決を appender 側に任せる)。
+/// `WorkerGuard` は process 終了まで生かす必要があるので Box::leak で 'static 化する。
 fn init_tracing_file(history_root: &Path) -> PathBuf {
     let log_path = history_root.join("tmoe.log");
     let _ = std::fs::create_dir_all(history_root);
@@ -338,8 +340,12 @@ fn init_tracing_file(history_root: &Path) -> PathBuf {
         .open(&log_path)
     {
         Ok(file) => {
+            let (writer, guard) = tracing_appender::non_blocking(file);
+            // guard を drop すると background worker が止まって書き込み損ねるので、
+            // process の lifetime に固定する。tmoe は単発バイナリなので leak で問題ない。
+            let _: &'static _ = Box::leak(Box::new(guard));
             let _ = tracing_subscriber::fmt()
-                .with_writer(std::sync::Mutex::new(file))
+                .with_writer(writer)
                 .with_ansi(false)
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_env("TMOE_LOG")
@@ -348,6 +354,8 @@ fn init_tracing_file(history_root: &Path) -> PathBuf {
                 .try_init();
         }
         Err(_) => {
+            // file open に失敗した場合は黙って sink に倒す。stderr は ratatui を壊すので
+            // 絶対に向けない。
             let _ = tracing_subscriber::fmt()
                 .with_writer(io::sink)
                 .try_init();

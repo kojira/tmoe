@@ -13,7 +13,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 /// TUI ペインに保持するログの最大行数。これを超えると古い行が破棄される (= スクロールバック上限)。
@@ -211,9 +211,11 @@ impl Widget for &App {
         let warn_n = pane_h(warn_pane);
         let feat_n = pane_h(bottom_tree);
 
-        // Concierge ペイン: 全幅で wrap 有効。長文ログがペイン幅を超えても改行されて
-        // 右端で切れない。tail は wrap 後の行数を考慮できないので、保守的に多めに渡す
-        // (Paragraph 側がペイン高で自動カット)。
+        // 各ペインを描画する前に **Clear で前フレームの cell を必ず空白にする**。
+        // ratatui の List widget は item 数が pane を埋めない時に余白を塗らないため、
+        // 前フレームの内容や stdout に直接書かれた tracing log のテキストが透けて
+        // 見える症状の根本対策。Concierge / status / input bar も同じ理由で塗る。
+        Clear.render(concierge_pane, buf);
         let conc_keep = (concierge_pane.height as usize).saturating_sub(2).max(1);
         let conc_visible = App::tail(&self.concierge, conc_keep);
         let conc_lines: Vec<Line> = conc_visible.iter().map(|s| Line::from(s.as_str())).collect();
@@ -222,7 +224,7 @@ impl Widget for &App {
             .block(Block::default().borders(Borders::ALL).title("Concierge"))
             .render(concierge_pane, buf);
 
-        // Trio ライブログ (末尾 N 行)。横幅は画面全幅。長行は List がそのまま切る。
+        Clear.render(trio_pane, buf);
         let trio_visible = App::tail(&self.trio_log, trio_n);
         let trio_items: Vec<ListItem> =
             trio_visible.iter().map(|s| ListItem::new(s.as_str())).collect();
@@ -230,7 +232,7 @@ impl Widget for &App {
             .block(Block::default().borders(Borders::ALL).title("Trio (Worker/Supervisor/Observer)"))
             .render(trio_pane, buf);
 
-        // Observer 警告 (末尾 N 行)。
+        Clear.render(warn_pane, buf);
         let warn_visible = App::tail(&self.observer_warnings, warn_n);
         let warn_items: Vec<ListItem> =
             warn_visible.iter().map(|s| ListItem::new(s.as_str())).collect();
@@ -238,19 +240,19 @@ impl Widget for &App {
             .block(Block::default().borders(Borders::ALL).title("Observer warnings"))
             .render(warn_pane, buf);
 
-        // 機能ツリー (末尾 N 行)。
+        Clear.render(bottom_tree, buf);
         let feat_visible = App::tail(&self.features, feat_n);
         let f_items: Vec<ListItem> = feat_visible.iter().map(|s| ListItem::new(s.as_str())).collect();
         List::new(f_items)
             .block(Block::default().borders(Borders::ALL).title("Features"))
             .render(bottom_tree, buf);
 
-        // Status bar (border 無し 1 行)。
+        Clear.render(status_bar, buf);
         Paragraph::new(self.status.as_str())
             .style(Style::default().add_modifier(Modifier::BOLD))
             .render(status_bar, buf);
 
-        // 入力欄 (border 無し 1 行、画面最下端)。
+        Clear.render(input_bar, buf);
         Paragraph::new(format!("> {}", self.input_buffer))
             .render(input_bar, buf);
     }
@@ -495,6 +497,40 @@ mod tests {
         assert_eq!(cy, drawn_y);
         // x = "> "(2) + "abc"(3) = 5
         assert_eq!(cx, 5);
+    }
+
+    #[test]
+    fn list_pane_inner_cells_are_blank_after_render_even_with_few_items() {
+        // ratatui の List widget は item 数を超えた余白を塗らないので、`Clear` 無しだと
+        // 前フレームの内容や直接書き込まれた文字列が透ける。Clear 挿入後はペイン内寸の
+        // 全 cell が空白 ' ' で塗られていることを確認 (= 焼き付き防止)。
+        let mut app = App::new();
+        // Trio に 1 行だけ入れて、ペイン内寸 (height-2) に余白を多く作る。
+        app.on_trio("only_one_line".into());
+        let area = Rect::new(0, 0, 80, 30);
+        // まず buffer を非空白で予め汚染しておく (= 前フレーム残骸を擬似再現)。
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        for x in 0..area.width {
+            for y in 0..area.height {
+                buf[(x, y)].set_symbol("X");
+            }
+        }
+        // 現在の render が cells を空白で塗り直すかを検証。
+        app.render(area, &mut buf);
+        // Trio ペインは constraints 上 [0]=Min(5), [1]=Length(8) なので、Concierge の
+        // 下に Trio が 8 行分 (border 込み) ある。内寸は 6 行。
+        // Trio ペインの内部 (border の 1 つ右、最終行の 1 つ上) で、`only_one_line`
+        // が入っている行 *以外* は空白であるべき。
+        // 大雑把に、画面左半分の各 row のすべての cell について「X」が残っていないことを確認。
+        let mut leftover_x = 0;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if buf[(x, y)].symbol() == "X" {
+                    leftover_x += 1;
+                }
+            }
+        }
+        assert_eq!(leftover_x, 0, "Clear should have wiped all 'X' cells; {leftover_x} remained");
     }
 
     #[test]
