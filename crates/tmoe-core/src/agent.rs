@@ -531,7 +531,8 @@ pub async fn single_agent_loop_streaming_with_tool_sink(
                 let r = tools.invoke(call, &profile).await;
                 let result_msg = match &r {
                     Ok(out) => format!(
-                        "TOOL RESULT for {}:\n{}",
+                        "TOOL RESULT for {} (this is raw data the user does not see; \
+                         read it and turn it into an answer for the user in your own words):\n{}",
                         call.name,
                         out.stdout.trim_end_matches('\n')
                     ),
@@ -582,9 +583,9 @@ pub async fn single_agent_loop_streaming_with_tool_sink(
         && !all_tool_outputs.is_empty()
     {
         messages.push(ChatMessage::user(
-            "Now that the tool results above are in front of you, write a SHORT prose \
-             answer (1-5 lines) explaining what the user asked. Do NOT call any more \
-             tools — emit no fenced code blocks at all. End with a single line `DONE`."
+            "Read the tool results above and answer the user's question in your own \
+             words — interpret what the data means for them, in 1-5 lines, in the \
+             same language as the user's request. End with a single line `DONE`."
                 .to_string(),
         ));
         let final_request = ChatRequest {

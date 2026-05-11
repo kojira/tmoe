@@ -458,8 +458,6 @@ pub async fn run_feature(
                     raw_body,
                 ));
                 // Worker の最終 proposal.note (= tool 結果を踏まえた答え) を Concierge に流す。
-                // 以前は no_op (= tool 呼ばなかった chat 経路) のときだけ流していたが、
-                // tool を呼んだ Commit 経路でも note は「ユーザに対する答え」なので流す。
                 let reply = proposal.note.trim().to_string();
                 if !reply.is_empty() {
                     if let Some(tx) = &event_tx {
@@ -508,9 +506,7 @@ pub async fn run_feature(
                     outcome.steps, rounds_used
                 ));
                 // 平面合意ができなくても、Worker が出した最終 note は「読んだ結果の
-                // 暫定回答」として持っているはず。silent に終わらず会話に流して
-                // ユーザに見せる (= 「could not reach a confident answer」だけでは
-                // 何も得るものがない)。
+                // 暫定回答」として持っているはず。silent に終わらず会話に流す。
                 let reply = last_proposal.note.trim().to_string();
                 if !reply.is_empty() {
                     if let Some(tx) = &event_tx {
@@ -754,6 +750,7 @@ fn short(s: &str, n: usize) -> String {
         format!("{head}…")
     }
 }
+
 
 fn is_git_repo(p: &Path) -> bool {
     git2::Repository::discover(p).is_ok()

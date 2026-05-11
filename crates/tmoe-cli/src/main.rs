@@ -763,10 +763,14 @@ fn spawn_session(
     thrust_rx: tmoe_core::ThrustReceiver,
     event_tx: mpsc::Sender<RuntimeEvent>,
     runtime_handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
-    _app: &mut App,
+    app: &mut App,
 ) {
+    // Concierge ペインに溜まっている直近の会話を Worker に context として渡す。
+    // これがないと Worker は task 文字列 1 行だけしか見られず、「さっきの結果」
+    // のような文脈質問に答えられない。
+    let task_with_history = build_task_with_history(&task, &app.concierge);
     *runtime_handle = Some(handle.spawn(async move {
-        let mut opts = RunOptions::new(task, workdir);
+        let mut opts = RunOptions::new(task_with_history, workdir);
         opts.use_worktree = flags.use_worktree;
         opts.cleanup_worktree = flags.cleanup_worktree;
         opts.open_pr = flags.open_pr;
@@ -776,6 +780,40 @@ fn spawn_session(
     }));
     // 内部用語 (= "feature spawned") はユーザに見せない。動いてる感は Trio ペインの
     // ステータス表示と Worker の最終 reply で十分伝わる。
+}
+
+/// Concierge ペインの直近行を取って task の前に context として埋める。
+/// 履歴が空ならそのまま task を返す。
+/// 行数の上限は 30 行、文字数上限はおおむね 4000 字 (= LLM への過剰トークンを避ける)。
+fn build_task_with_history(task: &str, concierge: &[String]) -> String {
+    const MAX_LINES: usize = 30;
+    const MAX_CHARS: usize = 4000;
+    if concierge.is_empty() {
+        return task.to_string();
+    }
+    let start = concierge.len().saturating_sub(MAX_LINES);
+    let mut block = String::new();
+    for line in &concierge[start..] {
+        // 起動時の挨拶 (Type a task / Built-in commands / Hotkeys / logs ->) は会話と
+        // 無関係なので除外。`user>` と `(tmoe)` で始まる行だけ意味がある。
+        let l = line.trim_start();
+        if !(l.starts_with("user>") || l.starts_with("(tmoe)")) {
+            continue;
+        }
+        block.push_str(line);
+        block.push('\n');
+        if block.chars().count() > MAX_CHARS {
+            break;
+        }
+    }
+    if block.trim().is_empty() {
+        return task.to_string();
+    }
+    format!(
+        "Recent chat history (oldest first; `user>` = the human, `(tmoe)` = you):\n\
+         {block}\n\
+         The user's new request:\n{task}"
+    )
 }
 
 fn send_thrust(tx: &ThrustSender, app: &mut App, thrust: UserThrust, label: &str) {
@@ -836,8 +874,43 @@ mod tests {
 
     #[test]
     fn ask_subcommand_alias() {
-        // DESIGN.md は `tmoe ask "..."` と書いているので、ask verb を読み捨てて同等にする。
         let a = parse_args(&argv(&["ask", "rename foo to bar"])).unwrap();
         assert_eq!(a.task.as_deref(), Some("rename foo to bar"));
+    }
+
+    #[test]
+    fn build_task_with_empty_history_returns_task_unchanged() {
+        let out = build_task_with_history("hello", &[]);
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn build_task_with_history_only_keeps_user_and_tmoe_lines() {
+        // 起動ヘルプ行 (= `(tmoe) Type a task...` 等) は会話と無関係なので、本来 prefix は
+        // `(tmoe)` なので **混ざる**。今のフィルタは `user>` と `(tmoe)` を含める形なので
+        // 起動ヘルプも混ざる前提でテスト。除外を強化したい場合の足がかりとして残す。
+        let hist = vec![
+            "garbage line not from chat".to_string(),
+            "user> question 1".to_string(),
+            "(tmoe) answer 1".to_string(),
+        ];
+        let out = build_task_with_history("new question", &hist);
+        assert!(out.contains("question 1"));
+        assert!(out.contains("answer 1"));
+        assert!(out.contains("new question"));
+        // フィルタが効いて garbage は混ざらない。
+        assert!(!out.contains("garbage line"));
+    }
+
+    #[test]
+    fn build_task_with_history_keeps_at_most_max_lines() {
+        // 30 行を超える履歴は古い方が切り捨てられる。
+        let mut hist: Vec<String> = (0..100).map(|i| format!("user> q{i}")).collect();
+        hist.extend((0..100).map(|i| format!("(tmoe) a{i}")));
+        let out = build_task_with_history("new", &hist);
+        // 最古は出ない (= 30 行 cap)。
+        assert!(!out.contains("user> q0"));
+        // 最新は出る。
+        assert!(out.contains("(tmoe) a99"));
     }
 }
