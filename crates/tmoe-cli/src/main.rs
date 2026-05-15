@@ -278,6 +278,7 @@ fn concierge_help_lines(log_path: &Path) -> Vec<String> {
         "(tmoe)   Ctrl-G          z_thrust=1.0 (resume the active feature)".into(),
         "(tmoe)   Ctrl-P          z_thrust=0   (pause the active feature)".into(),
         "(tmoe)   Ctrl-K          stop the active feature".into(),
+        "(tmoe)   Ctrl-R          pick a past session to resume".into(),
         "(tmoe)   Esc / Ctrl-C    quit the TUI (sends Stop first)".into(),
         format!("(tmoe) logs -> {}", log_path.display()),
     ]
@@ -505,7 +506,9 @@ fn tui_loop<B: ratatui::backend::Backend>(
     let mut app = App::new();
     app.on_concierge("(tmoe) Type a task and press Enter to start.".into());
     app.on_concierge("(tmoe) Built-in commands: help / quit".into());
-    app.on_concierge("(tmoe) Hotkeys: Ctrl-G=Go  Ctrl-P=Pause  Ctrl-K=Stop  Esc=Quit".into());
+    app.on_concierge(
+        "(tmoe) Hotkeys: Ctrl-G=Go  Ctrl-P=Pause  Ctrl-K=Stop  Ctrl-R=Resume picker  Esc=Quit".into(),
+    );
     app.on_concierge(format!("(tmoe) logs -> {}", log_path.display()));
 
     // 現在アクティブなセッションへの thrust 送信口。None ならアイドル (タスク未投入)。
@@ -615,6 +618,46 @@ fn tui_loop<B: ratatui::backend::Backend>(
                     tmoe_cli::app::QuitDecision::Pass => {}
                 }
                 match (k.code, k.modifiers) {
+                    // Ctrl-R: 履歴 picker を表示。直近 feature の番号付きリストを
+                    // Concierge ペインに出し、次の Enter で番号入力 → resume する。
+                    (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                        if current_thrust_tx.is_some() {
+                            app.on_concierge(
+                                "(tmoe) cannot pick resume while a session is running. Press Ctrl-K to stop first.".into(),
+                            );
+                        } else {
+                            match tmoe_history::HistoryStore::open(&cfg.history_root)
+                                .and_then(|s| s.list_features())
+                            {
+                                Ok(features) => {
+                                    if features.is_empty() {
+                                        app.on_concierge("(tmoe) no past sessions yet.".into());
+                                    } else {
+                                        app.resume_picks.clear();
+                                        app.on_concierge(
+                                            "(tmoe) recent sessions (type the number then Enter to resume; anything else cancels):".into(),
+                                        );
+                                        for (i, f) in features.iter().take(9).enumerate() {
+                                            let n = i + 1;
+                                            let title = if f.title.trim().is_empty() {
+                                                "(no title)".to_string()
+                                            } else {
+                                                f.title.clone()
+                                            };
+                                            app.on_concierge(format!("(tmoe)  [{n}] {title}"));
+                                            app.resume_picks
+                                                .push((n, f.id.clone(), title));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    app.on_concierge(format!(
+                                        "(tmoe) could not load history: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     _ if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         if let Some(thrust) = key_to_thrust(k) {
                             let label = match &thrust {
@@ -638,6 +681,40 @@ fn tui_loop<B: ratatui::backend::Backend>(
                     (KeyCode::Backspace, _) => app.backspace(),
                     (KeyCode::Enter, _) => {
                         let line = app.take_input();
+                        // Ctrl-R 直後の Enter で、入力が picker 上の番号なら resume を spawn。
+                        // 数字以外 / 範囲外なら picker をキャンセルして通常入力扱いに戻す。
+                        if !app.resume_picks.is_empty() {
+                            let picks = std::mem::take(&mut app.resume_picks);
+                            if let Ok(n) = line.trim().parse::<usize>() {
+                                if let Some((_, feature_id, title)) =
+                                    picks.iter().find(|(num, _, _)| *num == n).cloned()
+                                {
+                                    app.on_concierge(format!("user> {line}"));
+                                    app.on_concierge(format!(
+                                        "(tmoe) resuming session: {title}"
+                                    ));
+                                    let (tx, rx) = ThrustChannel::new();
+                                    let _ = tx.send(UserThrust::Go { strength: 1.0 });
+                                    let mut spawn_flags = flags.clone();
+                                    spawn_flags.resume_feature_id = Some(feature_id);
+                                    spawn_session(
+                                        &handle,
+                                        cfg.clone(),
+                                        workdir.clone(),
+                                        spawn_flags,
+                                        "Continue from where you left off.".to_string(),
+                                        rx,
+                                        event_tx.clone(),
+                                        &mut runtime_handle,
+                                        &mut app,
+                                    );
+                                    current_thrust_tx = Some(tx);
+                                    continue;
+                                }
+                            }
+                            app.on_concierge("(tmoe) resume picker canceled.".into());
+                            // 数字でなければ picker は閉じる。line はそのまま下の通常処理に流す。
+                        }
                         if line.is_empty() {
                             // 空 Enter: 何もしない。
                         } else if matches!(

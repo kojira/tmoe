@@ -46,6 +46,10 @@ pub struct App {
     /// Esc / Ctrl-C を 1 回押した状態。次のキーが Esc / Ctrl-C / y なら本当に終了、
     /// それ以外なら取り消し。誤操作で session 中断を防ぐための 2 段確認。
     pub quit_pending: bool,
+    /// Ctrl-R で履歴 picker を起動した時、選択肢として表示中の feature 一覧。
+    /// `(連番, feature_id, 表示用タイトル)` の形で、Concierge に番号付きで出している。
+    /// 次の Enter で `1` 等を入力すると該当 feature を resume として spawn する。
+    pub resume_picks: Vec<(usize, String, String)>,
 }
 
 impl App {

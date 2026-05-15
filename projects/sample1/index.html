@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ネオン猫のたこ焼きダッシュ</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle at 20% 10%, #26336f 0 18%, transparent 35%),
+                  radial-gradient(circle at 90% 85%, #5b1b63 0 20%, transparent 38%),
+                  linear-gradient(135deg, #080915, #12122a 55%, #070713);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow: hidden;
+      color: #fff;
+    }
+    .wrap {
+      width: min(96vw, 980px);
+      display: grid;
+      gap: 12px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 12px;
+      padding: 0 4px;
+      text-shadow: 0 2px 12px #000;
+    }
+    h1 { margin: 0; font-size: clamp(22px, 4vw, 42px); letter-spacing: .04em; }
+    .hint { opacity: .82; font-size: 14px; text-align: right; line-height: 1.45; }
+    canvas {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      border: 2px solid rgba(255,255,255,.18);
+      border-radius: 22px;
+      background: #101125;
+      box-shadow: 0 22px 80px rgba(0,0,0,.55), inset 0 0 34px rgba(120,220,255,.13);
+      touch-action: none;
+    }
+    .bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: center;
+      opacity: .9;
+      font-size: 14px;
+    }
+    kbd {
+      border: 1px solid rgba(255,255,255,.28);
+      border-bottom-width: 3px;
+      border-radius: 7px;
+      padding: 2px 7px;
+      background: rgba(255,255,255,.12);
+      font-weight: 700;
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 18px;
+      color: #08101b;
+      background: linear-gradient(135deg, #69f2ff, #ffd166, #ff5bd6);
+      font-weight: 900;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(255,91,214,.25);
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <div>
+        <h1>🐱 ネオン猫のたこ焼きダッシュ</h1>
+        <div>夜の屋台街で、フワフワおばけを避けながらたこ焼きを集めよう！</div>
+      </div>
+      <div class="hint">移動: <kbd>WASD</kbd>/<kbd>矢印</kbd><br>ダッシュ: <kbd>Space</kbd> / 画面タップ</div>
+    </header>
+    <canvas id="game" width="960" height="540" aria-label="ネオン猫のたこ焼きダッシュ"></canvas>
+    <div class="bar">
+      <button id="restart">最初から / Restart</button>
+      <span>面ごとのノルマ分たこ焼きを集めるとクリア！ 5面ごとにBOSS襲来。たこ焼きで攻撃しよう！</span>
+    </div>
+  </main>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const restartBtn = document.getElementById('restart');
+  const W = canvas.width, H = canvas.height;
+  const keys = new Set();
+  const rnd = (a, b) => Math.random() * (b - a) + a;
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+  let player, snacks, ghosts, boss, particles, score, best, lives, time, spawnTimer, gameOver, combo, invincible, dashCd, dashTime, shake, goldCooldown, stage, stageEaten, stageTarget, stageClearTimer, bossHitCd;
+  best = Number(localStorage.nekoTakoyakiBest || 0);
+
+  function reset() {
+    player = { x: W/2, y: H/2, r: 18, vx: 0, vy: 0, speed: 235, face: 1 };
+    snacks = [];
+    ghosts = [];
+    particles = [];
+    score = 0; lives = 3; time = 0; spawnTimer = 0; gameOver = false; combo = 0; invincible = 0; dashCd = 0; dashTime = 0; shake = 0; goldCooldown = 2; stage = 1; stageClearTimer = 0;
+    startStage();
+  }
+
+  function startStage() {
+    snacks = [];
+    ghosts = [];
+    boss = null;
+    particles = [];
+    stageEaten = 0; bossHitCd = 0;
+    const bossStage = stage % 5 === 0;
+    stageTarget = bossStage ? 0 : 9 + stage * 3;
+    time = 0;
+    spawnTimer = Math.max(1.0, 3.0 - stage * .16);
+    goldCooldown = Math.max(2.2, 5.0 - stage * .18);
+    invincible = Math.max(invincible, 1.1);
+    stageClearTimer = 0;
+    player.x = W/2; player.y = H/2; player.vx = player.vy = 0;
+    for (let i = 0; i < Math.min(10, 6 + stage); i++) addSnack(false);
+    if (bossStage) {
+      boss = { x: W/2, y: 118, r: 48, hp: 9 + Math.floor(stage * 1.5), maxHp: 9 + Math.floor(stage * 1.5), vx: 120, wobble: rnd(0, 99), pulse: 0, attack: 1.4 };
+      for (let i = 0; i < Math.min(7, 2 + stage / 2); i++) addGhost(true);
+    } else {
+      for (let i = 0; i < Math.min(10, 3 + stage); i++) addGhost(true);
+    }
+  }
+
+  function addSnack(gold = goldCooldown <= 0 && invincible <= 0 && !snacks.some(s => s.gold) && Math.random() < 0.09) {
+    if (snacks.length >= 13) return;
+    if (gold) goldCooldown = 7.5;
+    snacks.push({ x: rnd(40, W-40), y: rnd(54, H-40), r: gold ? 13 : 10, gold, pulse: rnd(0, 7) });
+  }
+
+  function addGhost(edge = false) {
+    const side = Math.floor(rnd(0, 4));
+    let x = rnd(30, W-30), y = rnd(50, H-30);
+    if (edge) {
+      if (side === 0) x = -30; if (side === 1) x = W + 30;
+      if (side === 2) y = 25; if (side === 3) y = H + 30;
+    }
+    ghosts.push({ x, y, r: rnd(17, 25), speed: rnd(72, 118) + Math.min(95, time * 1.2) + stage * 5, wobble: rnd(0, 99), angry: false });
+  }
+
+  function burst(x, y, color, n = 16) {
+    for (let i = 0; i < n; i++) particles.push({
+      x, y, vx: rnd(-170, 170), vy: rnd(-170, 170), life: rnd(.25, .75), max: .75, color, r: rnd(2, 5)
+    });
+  }
+
+  function dash() {
+    if (dashCd > 0 || gameOver) return;
+    const mx = (keys.has('ArrowRight') || keys.has('d')) - (keys.has('ArrowLeft') || keys.has('a'));
+    const my = (keys.has('ArrowDown') || keys.has('s')) - (keys.has('ArrowUp') || keys.has('w'));
+    const len = Math.hypot(mx, my) || 1;
+    player.vx += (mx || player.face) / len * 610;
+    player.vy += my / len * 610;
+    dashTime = .16; dashCd = 1.1; shake = 8;
+    burst(player.x, player.y, '#69f2ff', 10);
+  }
+
+  function update(dt) {
+    if (gameOver) {
+      // ゲームオーバー直後だけ揺らして、約2秒で静止させる
+      shake = Math.max(0, shake - dt * 8);
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i]; p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= .96; p.vy *= .96;
+        if (p.life <= 0) particles.splice(i, 1);
+      }
+      return;
+    }
+    if (stageClearTimer > 0) {
+      stageClearTimer -= dt;
+      shake = Math.max(0, shake - dt * 30);
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i]; p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= .96; p.vy *= .96;
+        if (p.life <= 0) particles.splice(i, 1);
+      }
+      if (stageClearTimer <= 0) { stage++; startStage(); }
+      return;
+    }
+    time += dt; spawnTimer -= dt; invincible = Math.max(0, invincible - dt); goldCooldown = Math.max(0, goldCooldown - dt); dashCd = Math.max(0, dashCd - dt); dashTime = Math.max(0, dashTime - dt); bossHitCd = Math.max(0, bossHitCd - dt); shake = Math.max(0, shake - dt * 30);
+
+    const mx = (keys.has('ArrowRight') || keys.has('d')) - (keys.has('ArrowLeft') || keys.has('a'));
+    const my = (keys.has('ArrowDown') || keys.has('s')) - (keys.has('ArrowUp') || keys.has('w'));
+    if (mx) player.face = mx;
+    const len = Math.hypot(mx, my) || 1;
+    const target = dashTime > 0 ? 0 : player.speed;
+    player.vx += (mx / len * target - player.vx) * Math.min(1, dt * 9);
+    player.vy += (my / len * target - player.vy) * Math.min(1, dt * 9);
+    player.x = clamp(player.x + player.vx * dt, player.r, W - player.r);
+    player.y = clamp(player.y + player.vy * dt, 42 + player.r, H - player.r);
+
+    for (const g of ghosts) {
+      const ang = Math.atan2(player.y - g.y, player.x - g.x) + Math.sin(time * 2 + g.wobble) * .55;
+      const flee = invincible > 0 && invincible < 2.7 ? -0.65 : 1;
+      g.angry = invincible <= 0 && time > 20;
+      const sp = g.speed * (g.angry ? 1.22 : 1) * (invincible > 0 ? .56 : 1);
+      g.x += Math.cos(ang) * sp * flee * dt;
+      g.y += Math.sin(ang) * sp * flee * dt;
+      g.x = clamp(g.x, invincible > 0 ? 18 : -40, invincible > 0 ? W - 18 : W + 40);
+      g.y = clamp(g.y, invincible > 0 ? 50 : 36, invincible > 0 ? H - 18 : H + 40);
+    }
+
+    if (boss) {
+      boss.pulse += dt * 5; boss.attack -= dt;
+      boss.x += boss.vx * dt;
+      if (boss.x < 80 || boss.x > W - 80) boss.vx *= -1;
+      boss.y = 112 + Math.sin(time * 1.7 + boss.wobble) * 26;
+      if (boss.attack <= 0) {
+        boss.attack = Math.max(.55, 1.55 - stage * .045);
+        addGhost(true);
+        burst(boss.x, boss.y, '#ff5bd6', 18);
+      }
+    }
+
+    for (let i = snacks.length - 1; i >= 0; i--) {
+      const s = snacks[i]; s.pulse += dt * 7;
+      if (dist(player, s) < player.r + s.r + 5) {
+        snacks.splice(i, 1); combo++;
+        const gain = (s.gold ? 120 : 25) * Math.min(10, combo);
+        score += gain;
+        stageEaten++;
+        if (s.gold) { invincible = Math.max(invincible, 3.4); goldCooldown = 8.5; }
+        burst(s.x, s.y, s.gold ? '#ffd166' : '#ff8a3d', s.gold ? 28 : 14);
+        if (boss) {
+          const damage = s.gold ? 3 : 1;
+          boss.hp -= damage; score += damage * 45; shake = Math.max(shake, s.gold ? 12 : 5);
+          burst(boss.x, boss.y, s.gold ? '#ffd166' : '#69f2ff', s.gold ? 34 : 18);
+          if (boss.hp <= 0) {
+            const bonus = stage * 650 + lives * 180 + Math.floor(invincible * 80);
+            score += bonus; best = Math.max(best, score); localStorage.nekoTakoyakiBest = best;
+            stageClearTimer = 3.0; invincible = Math.max(invincible, 2.5); shake = 24;
+            burst(boss.x, boss.y, '#ffd166', 80); burst(player.x, player.y, '#69f2ff', 46);
+            boss = null; ghosts.length = 0;
+            break;
+          }
+        } else if (stageEaten >= stageTarget) {
+          const bonus = stage * 350 + lives * 120 + Math.floor(invincible * 50);
+          score += bonus; best = Math.max(best, score); localStorage.nekoTakoyakiBest = best;
+          stageClearTimer = 2.4; invincible = Math.max(invincible, 2.0); shake = 18;
+          burst(player.x, player.y, '#69f2ff', 46);
+          ghosts.length = 0;
+          break;
+        }
+        addSnack(); if (snacks.length < 10 && Math.random() < .18) addSnack(false);
+      }
+    }
+
+    for (const g of ghosts) {
+      if (dist(player, g) < player.r + g.r - 3) {
+        if (invincible > 0) {
+          score += 180; burst(g.x, g.y, '#b4ff69', 24);
+          g.x = rnd(30, W-30); g.y = rnd(60, H-30);
+        } else {
+          lives--; combo = 0; invincible = 1.6; shake = 16; burst(player.x, player.y, '#ff4d6d', 30);
+          player.x = W/2; player.y = H/2; player.vx = player.vy = 0;
+          if (lives <= 0) {
+            gameOver = true;
+            best = Math.max(best, score); localStorage.nekoTakoyakiBest = best;
+          }
+          break;
+        }
+      }
+    }
+
+    if (boss && dist(player, boss) < player.r + boss.r - 6) {
+      if (invincible > 0 && bossHitCd <= 0) {
+        boss.hp -= 2; bossHitCd = .45; score += 220; shake = 14; burst(boss.x, boss.y, '#b4ff69', 34);
+        player.vx += Math.sign(player.x - boss.x || 1) * 430; player.vy += 260;
+        if (boss.hp <= 0) {
+          const bonus = stage * 650 + lives * 180 + Math.floor(invincible * 80);
+          score += bonus; best = Math.max(best, score); localStorage.nekoTakoyakiBest = best;
+          stageClearTimer = 3.0; invincible = Math.max(invincible, 2.5); shake = 24;
+          burst(boss.x, boss.y, '#ffd166', 80); boss = null; ghosts.length = 0;
+        }
+      } else if (invincible <= 0) {
+        lives--; combo = 0; invincible = 1.8; shake = 18; burst(player.x, player.y, '#ff4d6d', 32);
+        player.x = W/2; player.y = H - 84; player.vx = player.vy = 0;
+        if (lives <= 0) { gameOver = true; best = Math.max(best, score); localStorage.nekoTakoyakiBest = best; }
+      }
+    }
+
+    if (spawnTimer <= 0) {
+      spawnTimer = Math.max(.75, 3.0 - time * .035 - stage * .09);
+      if (ghosts.length < Math.min(boss ? 9 : 14, (boss ? 4 : 5) + stage)) addGhost(true);
+    }
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i]; p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= .96; p.vy *= .96;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  function drawCat(x, y) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(player.face, 1);
+    const blink = invincible > 0 && Math.floor(time * 12) % 2 === 0;
+    ctx.fillStyle = blink ? '#fff27a' : '#69f2ff';
+    ctx.beginPath(); ctx.arc(0, 0, player.r, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-13, -10); ctx.lineTo(-8, -27); ctx.lineTo(1, -12); ctx.moveTo(13, -10); ctx.lineTo(8, -27); ctx.lineTo(-1, -12); ctx.fill();
+    ctx.fillStyle = '#08101b';
+    ctx.beginPath(); ctx.arc(-7, -2, 2.5, 0, 7); ctx.arc(7, -2, 2.5, 0, 7); ctx.fill();
+    ctx.strokeStyle = '#08101b'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, 3); ctx.quadraticCurveTo(7, 8, 13, 5); ctx.stroke();
+    ctx.restore();
+  }
+
+  function draw() {
+    ctx.save();
+    if (shake) ctx.translate(rnd(-shake, shake), rnd(-shake, shake));
+    ctx.clearRect(-30, -30, W+60, H+60);
+
+    const grad = ctx.createLinearGradient(0, 0, W, H);
+    grad.addColorStop(0, '#15173a'); grad.addColorStop(.55, '#11142e'); grad.addColorStop(1, '#241033');
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+
+    ctx.strokeStyle = 'rgba(105,242,255,.09)'; ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += 48) { ctx.beginPath(); ctx.moveTo(x, 42); ctx.lineTo(x - 110, H); ctx.stroke(); }
+    for (let y = 60; y < H; y += 42) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+    for (const s of snacks) {
+      ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(Math.sin(s.pulse) * .2);
+      ctx.shadowBlur = s.gold ? 25 : 12; ctx.shadowColor = s.gold ? '#ffd166' : '#ff8a3d';
+      ctx.fillStyle = s.gold ? '#ffd166' : '#c46b35'; ctx.beginPath(); ctx.arc(0, 0, s.r, 0, 7); ctx.fill();
+      ctx.fillStyle = '#fff4c7'; ctx.fillRect(-5, -2, 10, 3); ctx.fillStyle = '#2ee66b'; ctx.fillRect(2, -8, 4, 4);
+      ctx.restore();
+    }
+
+    for (const g of ghosts) {
+      ctx.save(); ctx.translate(g.x, g.y + Math.sin(time * 4 + g.wobble) * 5);
+      ctx.shadowBlur = 22; ctx.shadowColor = g.angry ? '#ff4d6d' : '#b986ff';
+      ctx.fillStyle = invincible > 0 ? 'rgba(180,255,105,.72)' : (g.angry ? '#ff4d6d' : '#b986ff');
+      ctx.beginPath(); ctx.arc(0, -4, g.r, Math.PI, 0); ctx.lineTo(g.r, g.r*.75);
+      for (let i = 2; i >= -2; i--) ctx.quadraticCurveTo(i * g.r / 2, g.r * 1.1, (i-1) * g.r / 2, g.r * .75);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#101125'; ctx.beginPath(); ctx.arc(-7, -6, 3, 0, 7); ctx.arc(8, -6, 3, 0, 7); ctx.fill();
+      ctx.restore();
+    }
+
+    if (boss) {
+      ctx.save(); ctx.translate(boss.x, boss.y); ctx.scale(1 + Math.sin(boss.pulse) * .035, 1 - Math.sin(boss.pulse) * .025);
+      ctx.shadowBlur = 34; ctx.shadowColor = '#ff5bd6';
+      ctx.fillStyle = '#5b1b63'; ctx.beginPath(); ctx.arc(0, 0, boss.r, 0, 7); ctx.fill();
+      ctx.fillStyle = '#ff5bd6'; ctx.beginPath(); ctx.arc(0, -8, boss.r * .78, 0, 7); ctx.fill();
+      ctx.fillStyle = '#101125'; ctx.beginPath(); ctx.arc(-16, -12, 6, 0, 7); ctx.arc(16, -12, 6, 0, 7); ctx.fill();
+      ctx.strokeStyle = '#101125'; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(-18, 12); ctx.quadraticCurveTo(0, 24, 20, 8); ctx.stroke();
+      ctx.fillStyle = '#ffd166'; ctx.font = '900 18px system-ui'; ctx.textAlign = 'center'; ctx.fillText('BOSS', 0, -58); ctx.textAlign = 'left';
+      ctx.restore();
+
+      const hpW = 420, hpX = (W - hpW) / 2, hpY = 52;
+      ctx.fillStyle = 'rgba(0,0,0,.45)'; ctx.fillRect(hpX, hpY, hpW, 12);
+      ctx.fillStyle = '#ff5bd6'; ctx.fillRect(hpX, hpY, hpW * clamp(boss.hp / boss.maxHp, 0, 1), 12);
+      ctx.strokeStyle = 'rgba(255,255,255,.65)'; ctx.strokeRect(hpX, hpY, hpW, 12);
+    }
+
+    drawCat(player.x, player.y);
+
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.max); ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+    }
+
+    ctx.fillStyle = 'rgba(0,0,0,.33)'; ctx.fillRect(0, 0, W, 42);
+    ctx.fillStyle = '#fff'; ctx.font = '700 20px system-ui';
+    ctx.fillText(`面 ${stage}${boss ? ' BOSS' : ''}`, 18, 28); ctx.fillText(boss ? `HP ${Math.max(0, boss.hp)}` : `残り ${Math.max(0, stageTarget - stageEaten)}`, 116, 28);
+    ctx.fillText(`Score ${score}`, 180, 28); ctx.fillText(`Best ${best}`, 330, 28);
+    ctx.fillText(`❤ ${lives}`, 470, 28); ctx.fillText(`Combo x${Math.max(1, combo)}`, 555, 28);
+    if (invincible > 0) { ctx.fillStyle = '#ffd166'; ctx.fillText(`無敵 ${invincible.toFixed(1)}s`, 695, 28); }
+    ctx.fillStyle = dashCd > 0 ? 'rgba(255,255,255,.5)' : '#69f2ff'; ctx.fillText(dashCd > 0 ? `Dash ${dashCd.toFixed(1)}` : 'Dash OK', 825, 28);
+    const barW = 150, filled = barW * (boss ? clamp(1 - boss.hp / boss.maxHp, 0, 1) : clamp(stageEaten / stageTarget, 0, 1));
+    ctx.fillStyle = 'rgba(255,255,255,.15)'; ctx.fillRect(18, 36, barW, 4);
+    ctx.fillStyle = '#69f2ff'; ctx.fillRect(18, 36, filled, 4);
+
+    if (stageClearTimer > 0) {
+      ctx.fillStyle = 'rgba(0,0,0,.46)'; ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#69f2ff'; ctx.font = '900 54px system-ui'; ctx.fillText(`面 ${stage} クリア！`, W/2, H/2 - 42);
+      ctx.fillStyle = '#fff'; ctx.font = '700 24px system-ui'; ctx.fillText(`ボーナス獲得！ 次の面は${(stage + 1) % 5 === 0 ? 'BOSSステージ' : `たこ焼き ${9 + (stage + 1) * 3} 個でクリア`}`, W/2, H/2 + 8);
+      ctx.font = '18px system-ui'; ctx.fillText((stage + 1) % 5 === 0 ? '金のたこ焼きと無敵体当たりが大ダメージ！' : '少しずつおばけが増えて速くなるよ', W/2, H/2 + 46);
+      ctx.textAlign = 'left';
+    }
+
+    if (gameOver) {
+      ctx.fillStyle = 'rgba(0,0,0,.62)'; ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff'; ctx.font = '900 54px system-ui'; ctx.fillText('GAME OVER', W/2, H/2 - 42);
+      ctx.font = '700 25px system-ui'; ctx.fillText(`スコア ${score} / ベスト ${best}`, W/2, H/2 + 8);
+      ctx.font = '18px system-ui'; ctx.fillText('Restartボタンか Enter キーで再挑戦', W/2, H/2 + 48);
+      ctx.textAlign = 'left';
+    }
+    ctx.restore();
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(.033, (now - last) / 1000); last = now;
+    update(dt); draw(); requestAnimationFrame(loop);
+  }
+
+  addEventListener('keydown', e => {
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    keys.add(k);
+    if (e.code === 'Space') { e.preventDefault(); dash(); }
+    if (e.key === 'Enter' && gameOver) reset();
+  });
+  addEventListener('keyup', e => keys.delete(e.key.length === 1 ? e.key.toLowerCase() : e.key));
+  canvas.addEventListener('pointerdown', e => {
+    const rect = canvas.getBoundingClientRect();
+    const tx = (e.clientX - rect.left) / rect.width * W;
+    const ty = (e.clientY - rect.top) / rect.height * H;
+    const dx = tx - player.x, dy = ty - player.y, l = Math.hypot(dx, dy) || 1;
+    player.vx += dx / l * 420; player.vy += dy / l * 420; player.face = dx >= 0 ? 1 : -1; dash();
+  });
+  restartBtn.addEventListener('click', reset);
+  reset(); requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
